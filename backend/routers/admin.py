@@ -4,9 +4,6 @@ from backend.services.model_service import retrain_from_dataframe, MODEL_PATH
 import pandas as pd
 from datetime import datetime
 
-
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", None)
-
 router = APIRouter()
 
 @router.post("/admin/retrain")

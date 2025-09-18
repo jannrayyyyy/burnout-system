@@ -4,6 +4,7 @@ pandas
 numpy
 scikit-learn
 joblib
+firebase-admin
 sqlalchemy
 pydantic
 imbalanced-learn

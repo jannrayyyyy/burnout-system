@@ -11,5 +11,5 @@ venv/
 *.env
 *.json
 
-# Ignore models & big data (optional)
+# Ignore models & big data (optional)   
 *.csv
