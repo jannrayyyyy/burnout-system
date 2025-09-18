@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+
+# Environment variables / secrets
+*.env
+*.json
+
+# Ignore models & big data (optional)
+*.pkl
+*.csv
