@@ -12,5 +12,4 @@ venv/
 *.json
 
 # Ignore models & big data (optional)
-*.pkl
 *.csv
