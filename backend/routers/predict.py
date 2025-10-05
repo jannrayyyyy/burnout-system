@@ -1,7 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Dict, Any
-import pandas as pd
 from datetime import datetime
 from backend.services.model_service import run_prediction
 from backend.services.firebase_service import db
@@ -28,14 +27,18 @@ def predict(payload: InputPayload):
 
 @router.post("/submit")
 def submit(payload: InputPayload):
+    """Submit a survey, run prediction, and save to Firebase (both survey_responses + untrained_surveys)."""
     result = run_prediction(payload.data)
-
-    doc_ref = db.collection("survey_responses").document()
-    doc_ref.set({
-        "created_at": datetime.utcnow().isoformat(),
+    doc_data = {
         "data": payload.data,
-        "prediction": result["burnout_level"],
-        "probability": result["probability"]
-    })
+        "all_probabilities": result["all_probabilities"],
+        "probability": result["probability"],
+        "burnout_level":result["burnout_level"],
+    }
 
-    return {"id": doc_ref.id, **result}
+    # Save to main collection
+    db.collection("survey_responses").add(doc_data)
+    # Also add to untrained_surveys
+    db.collection("untrained_surveys").add(doc_data)
+
+    return {"message": "Survey submitted", **result}

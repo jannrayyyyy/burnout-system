@@ -1,29 +1,95 @@
 # backend/routers/admin.py
 from fastapi import APIRouter, HTTPException, Query, Header
-from backend.services.data_service import export_responses_csv, fetch_all_responses
-from backend.services.model_service import retrain_from_dataframe, MODEL_PATH, list_versions_from_files, rollback_to_version
-from backend.services.firebase_service import db
-import pandas as pd
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from datetime import datetime
+import pandas as pd
 import os
+import logging
+
+from backend.services.data_service import export_responses_csv, fetch_all_responses
+from backend.services.model_service import (
+    retrain_from_dataframe,
+    MODEL_PATH,
+    list_versions_from_files,
+    rollback_to_version,
+    add_survey_without_prediction,
+    get_current_model_info,
+    hard_reset,
+    train_from_untrained,
+)
+from backend.services.firebase_service import db
+
+from datetime import datetime
+from google.cloud.firestore import DocumentSnapshot
+from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
+# ===============================
+# 🔐 Admin Auth Helper
+# ===============================
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", None)
 
 def _require_admin(x_admin_secret: str = Header(None)):
     if ADMIN_SECRET and x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-@router.post("/admin/retrain")
-def retrain_model(description: str = Query("Retrained via admin panel", description="Description of changes"), x_admin_secret: str = Header(None)):
+
+# ===============================
+# 🧠 Train Endpoint (one-shot)
+# ===============================
+@router.post("/admin/train")
+def train_model(
+    description: str = Query("Initial train via admin panel", description="Description for model metadata"),
+    x_admin_secret: str = Header(None),
+):
     _require_admin(x_admin_secret)
+    try:
+        version, count = train_from_untrained(description=description)
+        return {
+            "message": "Model trained successfully",
+            "version": version,
+            "records_used": count,
+            "trained_at": datetime.utcnow().isoformat(),
+            "description": description,
+        }
+    except RuntimeError as e:
+        # For example: model already exists
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Unexpected error in /admin/train")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ===============================
+# 🧠 Retrain Endpoint
+# ===============================
+@router.post("/admin/retrain")
+def retrain_model(
+    description: str = Query("Retrained via admin panel", description="Description of changes"),
+    x_admin_secret: str = Header(None),
+):
+    _require_admin(x_admin_secret)
+
     rows = fetch_all_responses()
     if not rows:
         raise HTTPException(status_code=400, detail="No data available to retrain")
 
-    df = pd.DataFrame([r["data"] | {"prediction": r.get("prediction")} for r in rows if "data" in r])
-    version, count = retrain_from_dataframe(df, description=description)
+    try:
+        df = pd.DataFrame([r["data"] | {"prediction": r.get("prediction")} for r in rows if "data" in r])
+    except Exception:
+        # fallback if data shapes differ
+        df = pd.DataFrame([r.get("data") or r for r in rows])
+
+    try:
+        version, count = retrain_from_dataframe(df, description=description)
+    except Exception as e:
+        logger.exception("Failed to retrain model")
+        raise HTTPException(status_code=500, detail=str(e))
 
     return {
         "message": "Model retrained",
@@ -33,16 +99,29 @@ def retrain_model(description: str = Query("Retrained via admin panel", descript
         "description": description,
     }
 
+
+# ===============================
+# 📤 Export Data
+# ===============================
 @router.get("/admin/export")
-def export_csv(x_admin_secret: str = Header(None)):
+def export_csv(upload_to_storage: bool = Query(False), x_admin_secret: str = Header(None)):
     _require_admin(x_admin_secret)
-    resp = export_responses_csv()
+    resp = export_responses_csv(upload_to_storage=upload_to_storage)
     if not resp:
         raise HTTPException(status_code=400, detail="No data found")
-    return resp
+    # If file_response is returned
+    if "file_response" in resp:
+        return resp["file_response"]
+    else:
+        return resp
 
+
+# ===============================
+# 📊 Model Info
+# ===============================
 @router.get("/admin/info")
-def model_info():
+def model_info(x_admin_secret: str = Header(None)):
+    _require_admin(x_admin_secret)
     last_trained = None
     if MODEL_PATH.exists():
         last_trained = datetime.fromtimestamp(MODEL_PATH.stat().st_mtime).isoformat()
@@ -51,27 +130,96 @@ def model_info():
         "records_in_db": len(fetch_all_responses()),
     }
 
+
+# ===============================
+# 📦 List Models
+# ===============================
+
 @router.get("/admin/models")
-def list_models():
-    # Prefer listing metadata from Firestore if available
+@router.get("/admin/models")
+def list_models(x_admin_secret: str = Header(None)):
+    """
+    List all trained models from Firestore with full JSON safety.
+    Handles NaN/Inf floats, Firestore Timestamps, and nested structures in sample_preview.
+    Falls back to local model files if Firestore query fails.
+    """
+    _require_admin(x_admin_secret)
     models_meta = []
+
+    import math
+
+    def _safe_value(v):
+        """Recursively convert any Firestore / Python value into JSON-safe form."""
+        # Basic types
+        if isinstance(v, float):
+            if math.isnan(v) or math.isinf(v):
+                return None
+            return v
+        if isinstance(v, datetime):
+            return v.isoformat()
+        if hasattr(v, "isoformat"):  # Firestore Timestamp
+            return v.isoformat()
+        if isinstance(v, (list, tuple)):
+            return [_safe_value(i) for i in v]
+        if isinstance(v, dict):
+            return {k: _safe_value(i) for k, i in v.items()}
+        return v
+
     try:
-        docs = db.collection("models").order_by("created_at", direction= "DESCENDING").stream()
+        docs = db.collection("models").order_by("created_at", direction="DESCENDING").stream()
+
         for doc in docs:
             d = doc.to_dict()
             d["id"] = doc.id
-            models_meta.append(d)
-    except Exception:
+
+            # Ensure all required fields exist (fill missing with defaults)
+            d.setdefault("created_at", datetime.utcnow().isoformat())
+            d.setdefault("description", "")
+            d.setdefault("file", "")
+            d.setdefault("records_used", 0)
+            d.setdefault("sample_preview", [])
+            d.setdefault("source_collection", "")
+            d.setdefault("training_type", "unsupervised")
+            d.setdefault("version", 0)
+
+            # Make all values JSON-safe
+            safe_doc = {k: _safe_value(v) for k, v in d.items()}
+            models_meta.append(safe_doc)
+
+    except Exception as e:
+        logger.exception(f"Error fetching Firestore models: {e}")
         # fallback to local files
+        from pathlib import Path
         files = list_versions_from_files()
         for f in files:
             models_meta.append({
-                "version": f.get("version"),
-                "file": f.get("file"),
-                "created_at": datetime.fromtimestamp(f.get("modified")).isoformat()
+                "version": int(f.get("version")),
+                "file": str(f.get("file")),
+                "created_at": datetime.fromtimestamp(f.get("modified")).isoformat(),
+                "description": "Local file model",
+                "records_used": 0,
+                "sample_preview": [],
+                "source_collection": "local",
+                "training_type": "unknown"
             })
+
+    # Double-sanitize and validate JSON
+    try:
+        import json
+        json.dumps(models_meta, allow_nan=False)
+    except ValueError:
+        # Replace any lingering invalid floats
+        for m in models_meta:
+            for k, v in m.items():
+                if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                    m[k] = None
+
     return {"count": len(models_meta), "items": models_meta}
 
+
+# ===============================
+# 🔄 Rollback
+# ===============================
 @router.post("/admin/rollback/{version}")
 def rollback(version: int, x_admin_secret: str = Header(None)):
     _require_admin(x_admin_secret)
@@ -82,26 +230,90 @@ def rollback(version: int, x_admin_secret: str = Header(None)):
     return {"message": "Rolled back", "version": v, "rolled_back_at": datetime.utcnow().isoformat()}
 
 
+# ===============================
+# 🔍 Current Model
+# ===============================
 @router.get("/admin/current")
-def current_model():
+def current_model(x_admin_secret: str = Header(None)):
+ def current_model(x_admin_secret: str = Header(None)):
+    """
+    Return current active model metadata, safely JSON-compliant.
+    If no model is found, returns an empty payload instead of error.
+    """
+    _require_admin(x_admin_secret)
     info = get_current_model_info()
-    if not info:
-        raise HTTPException(status_code=404, detail="No active model found")
-    return info
 
+    import math
+    from datetime import datetime
+
+    def _safe_value(v):
+        """Convert nested model info to JSON-safe primitives."""
+        if isinstance(v, float):
+            if math.isnan(v) or math.isinf(v):
+                return None
+            return v
+        if isinstance(v, datetime):
+            return v.isoformat()
+        if hasattr(v, "isoformat"):  # Firestore Timestamp
+            return v.isoformat()
+        if isinstance(v, (list, tuple)):
+            return [_safe_value(i) for i in v]
+        if isinstance(v, dict):
+            return {k: _safe_value(i) for k, i in v.items()}
+        return v
+
+    if not info:
+        return {"message": "No active model found", "version": None}
+
+    try:
+        safe_info = {k: _safe_value(v) for k, v in info.items()}
+    except Exception:
+        safe_info = {"message": "Invalid model metadata", "version": None}
+
+    # Validate JSON compliance
+    import json
+    try:
+        json.dumps(safe_info, allow_nan=False)
+    except ValueError:
+        for k, v in list(safe_info.items()):
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                safe_info[k] = None
+
+    return safe_info
+
+# ===============================
+# 📂 Model Data Preview
+# ===============================
 @router.get("/admin/data/{version}")
 def model_data(version: int, x_admin_secret: str = Header(None)):
     _require_admin(x_admin_secret)
-    """
-    Fetch survey data (training data) used for a given version.
-    This will just fetch all responses until now — since retrain uses all responses.
-    In the future, you can store exact dataset snapshot per version.
-    """
     rows = fetch_all_responses()
     if not rows:
         raise HTTPException(status_code=404, detail="No data available")
 
     df = pd.DataFrame([r["data"] | {"prediction": r.get("prediction")} for r in rows if "data" in r])
-    # only return a preview
     preview = df.head(50).to_dict(orient="records")
     return JSONResponse({"version": version, "preview_count": len(preview), "preview": preview})
+
+
+# ===============================
+# 📝 Add Survey (without prediction)
+# ===============================
+class InputPayload(BaseModel):
+    data: dict
+
+@router.post("/admin/submit")
+def submit(payload: InputPayload, x_admin_secret: str = Header(None)):
+    _require_admin(x_admin_secret)
+    result = add_survey_without_prediction(payload.data)
+    return {"message": "Survey added (no prediction)", **result}
+
+
+# ===============================
+# 💣 Hard Reset Endpoint
+# ===============================
+@router.post("/admin/reset")
+def reset_all(x_admin_secret: str = Header(None)):
+    _require_admin(x_admin_secret)
+    result = hard_reset()
+    return result
