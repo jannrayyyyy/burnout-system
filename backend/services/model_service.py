@@ -68,31 +68,168 @@ def _build_pipeline() -> Pipeline:
 # 1) Prediction
 # ---------------------
 def run_prediction(data: dict):
+    """
+    Run burnout prediction using the active model.
+    Cleans input, aligns with training features, stores a consistent untrained_surveys record,
+    and returns a structured explanation and probabilities.
+    """
+    import pandas as pd
     global clf_pipeline
     if clf_pipeline is None:
         raise RuntimeError("No model loaded. Train or deploy a model first.")
-    df = pd.DataFrame([data])
+
+    # Step 1: Define valid features (must match training)
+    MODEL_FEATURES = [
+        "age", "gender", "gwa", "hours_online", "motivation",
+        "num_subjects", "perceived_stress", "procrastination",
+        "sleep_hours", "study_hours", "year_level"
+    ]
+
+    # Step 2: Normalize and clean incoming data
+    clean_data = {}
+    alias_map = {
+        "num_subject": "num_subjects",
+        "subjects": "num_subjects",
+        "hours": "hours_online",
+        "perceived": "perceived_stress",
+        "procrastination_level": "procrastination",
+        "study": "study_hours",
+        "sleep": "sleep_hours"
+    }
+
+    for k, v in data.items():
+        key = alias_map.get(k.strip().lower(), k.strip().lower())
+        if isinstance(v, str):
+            v = v.strip().replace(";", "").lower()
+        clean_data[key] = v
+
+    # Keep only valid model features
+    clean_data = {k: v for k, v in clean_data.items() if k in MODEL_FEATURES}
+
+    # Step 3: Prepare DataFrame
+    df = pd.DataFrame([clean_data])
+
+    # Step 4: Run prediction
     proba = clf_pipeline.predict_proba(df)[0]
     classes = clf_pipeline.classes_
     best_idx = int(proba.argmax())
     best_class = str(classes[best_idx])
     best_prob = float(proba[best_idx])
 
-    # log survey into untrained_surveys for later training review
-    db.collection("untrained_surveys").add({
-        **data,
-        "burnout_level": best_class,
-        "probability": best_prob,
-        "created_at": datetime.utcnow().isoformat(),
-        "status": "predicted"
-    })
+    # Step 5: Log the prediction for retraining later.
+    # Save a consistent document shape: keep raw survey under `data` and attach prediction metadata.
+    try:
+        db.collection("untrained_surveys").add({
+            "data": clean_data,
+            "prediction": best_class,
+            "probability": best_prob,
+            "created_at": datetime.utcnow().isoformat(),
+            "status": "predicted",
+        })
+    except Exception:
+        # Don't fail prediction if logging to Firestore fails; just warn.
+        logger.exception("Failed to write prediction to untrained_surveys")
 
+    # Step 6: Model explainability
+    model_info = get_current_model_info() or {}
+    explanation = {}
+    try:
+        preprocessor = clf_pipeline.named_steps["preprocessor"]
+        # sklearn's ColumnTransformer + OneHotEncoder may expose get_feature_names_out
+        try:
+            feature_names = list(preprocessor.get_feature_names_out())
+        except Exception:
+            # Fallback: synthesize feature names from pipeline components
+            feature_names = []
+
+        importances = clf_pipeline.named_steps["clf"].feature_importances_
+
+        # Map encoded feature names back to human features
+        feature_importance_map = dict(zip(feature_names, importances)) if feature_names else {}
+        grouped_importance = {}
+        feature_display = {}
+
+        # If we don't have encoder feature names, use raw features from clean_data
+        if not feature_importance_map:
+            for k, v in clean_data.items():
+                grouped_importance[k] = 0.0
+                feature_display[k] = v
+        else:
+            for fname, score in feature_importance_map.items():
+                # attempt to recover base feature name
+                if "__" in fname:
+                    base = fname.split("__")[-1]
+                else:
+                    base = fname
+
+                if "_" in base and base.split("_")[0] in clean_data:
+                    root = base.split("_")[0]
+                    feature_key = root
+                    feature_value = clean_data.get(root, base.split("_", 1)[1])
+                else:
+                    feature_key = base
+                    feature_value = clean_data.get(feature_key, "unknown")
+
+                grouped_importance[feature_key] = grouped_importance.get(feature_key, 0) + abs(float(score))
+                feature_display[feature_key] = feature_value
+
+        # Normalize importances
+        total = sum(grouped_importance.values()) or 1.0
+        grouped_importance = {k: v / total for k, v in grouped_importance.items()}
+
+        # Select top 5
+        top_features = sorted(grouped_importance.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        label_map = {
+            "age": "Age",
+            "gender": "Gender",
+            "gwa": "GWA (General Weighted Average)",
+            "hours_online": "Hours spent online per day",
+            "motivation": "Motivation level",
+            "num_subjects": "Number of subjects",
+            "perceived_stress": "Perceived stress level",
+            "procrastination": "Procrastination level",
+            "sleep_hours": "Sleep hours per day",
+            "study_hours": "Study hours per day",
+            "year_level": "Year level"
+        }
+
+        def human_label(name: str):
+            return label_map.get(name, name.replace("_", " ").capitalize())
+
+        summary_parts = []
+        for feature, importance in top_features:
+            label = human_label(feature)
+            val = feature_display.get(feature, "unspecified")
+            if pd.isna(val) or val in ["unknown", None, "nan"]:
+                val = "unspecified"
+
+            if importance > 0.15:
+                summary_parts.append(f"{label} ({val}) shows a strong influence on burnout risk.")
+            elif importance > 0.05:
+                summary_parts.append(f"{label} ({val}) moderately affects the predicted burnout level.")
+            else:
+                summary_parts.append(f"{label} ({val}) has a minor impact on the burnout prediction.")
+
+        explanation = {
+            "top_features": {k: feature_display.get(k, "unspecified") for k, _ in top_features},
+            "feature_contributions": {k: round(v, 3) for k, v in grouped_importance.items()},
+            "summary": (" ".join(summary_parts) if summary_parts else "No dominant features were identified for this prediction.")
+        }
+
+    except Exception as e:
+        explanation = {"summary": f"Explanation unavailable: {str(e)}"}
+
+    # Step 7: Return the full structured result
     return {
         "burnout_level": best_class,
         "probability": best_prob,
-        "all_probabilities": dict(zip(map(str, classes.tolist()), proba.tolist()))
+        "all_probabilities": dict(zip(map(str, classes.tolist()), proba.tolist())),
+        "model_version": model_info.get("version"),
+        "model_records_used": model_info.get("records_used"),
+        "model_created_at": model_info.get("created_at"),
+        "explanation": explanation,
     }
-
 
 # ---------------------
 # 2) Train from untrained_surveys (one-shot)
@@ -164,39 +301,73 @@ def train_from_untrained(description: str = "Initial trained model") -> Tuple[in
             if col in df.columns:
                 df = df.drop(columns=[col])
 
-        # Convert all possible numeric columns safely
-        for col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        # Robust feature construction:
+        # - Try to coerce numeric-like columns to numeric
+        # - Encode low-cardinality categorical columns (e.g., gender, year_level)
+        candidate_features = [
+            "age", "gender", "gwa", "hours_online", "motivation",
+            "num_subjects", "perceived_stress", "procrastination",
+            "sleep_hours", "study_hours", "year_level"
+        ]
 
-        # Keep only numeric columns
-        numeric_df = df.select_dtypes(include=[np.number]).copy()
+        X_work = df.copy()
+
+        # Try to coerce possible numeric columns
+        for col in list(X_work.columns):
+            # Skip obviously non-feature columns
+            if col in ["id"]:
+                continue
+            # If column is object, try converting to numeric
+            if X_work[col].dtype == object:
+                coerced = pd.to_numeric(X_work[col], errors="coerce")
+                # If at least one non-na conversion succeeded, use numeric
+                if coerced.notna().any():
+                    X_work[col] = coerced
+
+        # Build features list: numeric columns plus encoded low-cardinality categoricals
+        numeric_df = X_work.select_dtypes(include=[np.number]).copy()
+
+        # Label-encode low-cardinality categoricals (<=10 unique non-null values)
+        categorical_cols = []
+        for col in X_work.select_dtypes(include=[object]).columns:
+            nunique = X_work[col].nunique(dropna=True)
+            if 0 < nunique <= 10 and col in candidate_features:
+                # factorize into numeric codes; reserve -1 for NaN
+                codes, uniques = pd.factorize(X_work[col].fillna("__MISSING__"))
+                categorical_cols.append((col, codes))
+
+        # Combine numeric and encoded categorical features
+        feature_df = numeric_df.copy()
+        for col, codes in categorical_cols:
+            feature_df[col] = codes
 
         # Drop all-NaN columns
-        numeric_df = numeric_df.dropna(axis=1, how="all")
+        feature_df = feature_df.dropna(axis=1, how="all")
 
-        if numeric_df.empty:
-            raise ValueError(
-                "Cannot perform unsupervised training: no numeric fields found. "
-                "Ensure surveys include numeric values like 'age', 'hours_online', 'gwa', etc."
-            )
-
-        # Fill NaNs with median
+        # Fill numeric NaNs with median
         from sklearn.impute import SimpleImputer
-        imputer = SimpleImputer(strategy="median")
-        numeric_df = pd.DataFrame(imputer.fit_transform(numeric_df), columns=numeric_df.columns)
+        numeric_cols = feature_df.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 0:
+            feature_df[numeric_cols] = SimpleImputer(strategy="median").fit_transform(feature_df[numeric_cols])
 
         # Drop constant columns
-        numeric_df = numeric_df.loc[:, numeric_df.apply(pd.Series.nunique) > 1]
-        if numeric_df.empty:
-            raise ValueError("Cannot perform unsupervised training: all numeric fields have constant values.")
+        feature_df = feature_df.loc[:, feature_df.apply(pd.Series.nunique) > 1]
+        if feature_df.empty:
+            # Provide a helpful error including available columns and sample values
+            sample = df.head(5).to_dict(orient="records")
+            raise ValueError(
+                "Cannot perform unsupervised training: no usable feature columns found (all constant or non-numeric). "
+                "Include numeric survey fields like 'age', 'hours_online', 'gwa', or add variability to the dataset. "
+                f"Sample rows: {sample}"
+            )
 
         # Determine cluster count
         import numpy as np
         from sklearn.cluster import KMeans
-        unique_rows = np.unique(numeric_df, axis=0)
+        unique_rows = np.unique(feature_df.to_numpy(), axis=0)
         n_clusters = min(3, len(unique_rows))
         if n_clusters < 2:
-            raise ValueError("Not enough unique numeric data to form clusters.")
+            raise ValueError("Not enough unique data rows to form clusters. Add more diverse survey responses.")
 
         # Run KMeans
         try:
@@ -260,6 +431,8 @@ def train_from_untrained(description: str = "Initial trained model") -> Tuple[in
         "source_collection": "untrained_surveys",
         "training_type": "unsupervised" if not label_cols else "supervised",
         "sample_preview": sample_preview,
+        "active": True,
+        "activated_at": datetime.utcnow().isoformat()
     }
     db.collection("models").add(meta)
 
@@ -272,55 +445,76 @@ def train_from_untrained(description: str = "Initial trained model") -> Tuple[in
 # ---------------------
 def retrain_from_dataframe(df: pd.DataFrame, description: str = "Retrained model"):
     """
-    Retrain model using provided dataframe. If no 'prediction' column, will try to auto-generate pseudo-labels
-    using the currently loaded model (if available). Raises on empty df.
+    Retrain model using provided dataframe.
+    If 'prediction' is missing, pseudo-label using current model.
     """
     if df.empty:
         raise ValueError("No data available for retraining")
 
     global clf_pipeline
+    if clf_pipeline is None and "prediction" not in df.columns:
+        raise RuntimeError("No existing model found to generate pseudo-labels")
 
-    # If no 'prediction' column, attempt pseudo-label generation
+    # --- Generate pseudo-labels if needed ---
     if "prediction" not in df.columns:
-        logger.warning("'prediction' column missing — attempting pseudo-label generation using current model")
-        if clf_pipeline is None:
-            raise RuntimeError("No existing model found to generate pseudo-labels; provide labels in 'prediction' column.")
-        # Determine features used by pipeline:
-        feature_columns = [col for col in df.columns if col not in ["id", "created_at", "timestamp"]]
-        df["prediction"] = clf_pipeline.predict(df[feature_columns])
+        logger.warning("No 'prediction' column found — generating pseudo-labels using current model")
+        feature_columns = [
+            col for col in df.columns
+            if col not in ["id", "created_at", "timestamp", "status", "trained_at", "model_version"]
+        ]
 
-    # Now proceed with training
-    X = df.drop(columns=["prediction"]).copy()
+        # Coerce non-numeric columns to string before predicting
+        df_pred = df.copy()
+        for col in feature_columns:
+            if df_pred[col].dtype == "object":
+                df_pred[col] = df_pred[col].astype(str)
+
+        df["prediction"] = clf_pipeline.predict(df_pred[feature_columns])
+
+    # --- Prepare training data ---
+    X = df.drop(columns=["prediction"], errors="ignore").copy()
     y = df["prediction"].astype(str).copy()
 
-    pipeline = _build_pipeline()
-    pipeline.fit(X, y)
+    drop_cols = ["created_at", "status", "timestamp", "trained_at", "model_version", "id"]
+    X = X.drop(columns=[c for c in drop_cols if c in X.columns])
 
-    # versioning
+    # --- Convert to numeric where possible ---
+    for col in X.columns:
+        if col != "gender":
+            X[col] = pd.to_numeric(X[col], errors="coerce")
+
+    numeric_df = X.select_dtypes(include=[np.number])
+    if "gender" in X.columns:
+        X_clean = pd.concat([X["gender"], numeric_df], axis=1)
+    else:
+        X_clean = numeric_df
+
+    # --- Clean NaNs and constants ---
+    X_clean = X_clean.dropna(axis=1, how="all")
+    if X_clean.empty:
+        raise ValueError("No usable feature columns found for retraining.")
+
+    from sklearn.impute import SimpleImputer
+    numeric_cols = X_clean.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) > 0:
+        X_clean[numeric_cols] = SimpleImputer(strategy="median").fit_transform(X_clean[numeric_cols])
+    if "gender" in X_clean.columns:
+        X_clean["gender"] = X_clean["gender"].fillna("unknown")
+
+    # --- Train new pipeline ---
+    pipeline = _build_pipeline()
+    pipeline.fit(X_clean, y)
+
+    # --- Save new version ---
     existing = sorted(MODELS_DIR.glob("burnout_v*.pkl"))
-    version = 1 if not existing else (len(existing) + 1)
+    version = len(existing) + 1
     version_file = MODELS_DIR / f"burnout_v{version}.pkl"
 
     joblib.dump(pipeline, version_file)
     joblib.dump(pipeline, MODEL_PATH)
-
     clf_pipeline = pipeline
 
-    # Move untrained_surveys -> trained_surveys & annotate with version
-    untrained_docs = db.collection("untrained_surveys").stream()
-    moved = 0
-    for doc in untrained_docs:
-        try:
-            data = doc.to_dict()
-            data["trained_at"] = datetime.utcnow().isoformat()
-            data["model_version"] = version
-            db.collection("trained_surveys").add(data)
-            db.collection("untrained_surveys").document(doc.id).delete()
-            moved += 1
-        except Exception:
-            logger.exception(f"Failed to move doc {doc.id}")
-
-    # Log model metadata
+    # --- Update Firestore ---
     sample_preview = df.head(10).to_dict(orient="records")
     meta = {
         "version": version,
@@ -329,11 +523,17 @@ def retrain_from_dataframe(df: pd.DataFrame, description: str = "Retrained model
         "records_used": len(df),
         "description": description,
         "source_collection": "retrain_from_dataframe",
+        "training_type": "retrain",
         "sample_preview": sample_preview,
+        "active": True,
+        "activated_at": datetime.utcnow().isoformat()
     }
     db.collection("models").add(meta)
 
+    logger.info(f"Model v{version} retrained successfully on {len(df)} records.")
+
     return version, len(df)
+
 
 
 # ---------------------
@@ -381,28 +581,51 @@ def get_current_model_info():
     if not MODEL_PATH.exists():
         return None
 
-    # Try to get metadata doc from 'models' collection
-    docs = db.collection("models").order_by("created_at", direction="DESCENDING").limit(10).stream()
-    for doc in docs:
-        d = doc.to_dict()
-        if "file" in d:
+    try:
+        # Fetch models ordered by created_at descending
+        docs = db.collection("models").order_by("activated_at", direction="DESCENDING").limit(20).stream()
+        latest_doc = None
+        active_doc = None
+
+        for doc in docs:
+            d = doc.to_dict() or {}
+            d["id"] = doc.id
+
+            # Prefer the one explicitly marked as active
+            if d.get("active") is True:
+                active_doc = d
+                break
+
+            # Fallback: remember the most recent
+            if latest_doc is None:
+                latest_doc = d
+
+        model_doc = active_doc or latest_doc
+        if model_doc:
             return {
-                "version": d.get("version"),
-                "file": d.get("file"),
-                "created_at": d.get("created_at"),
-                "records_used": d.get("records_used"),
-                "description": d.get("description", "-"),
-                "source_collection": d.get("source_collection"),
-                "sample_preview": d.get("sample_preview", []),
+                "version": model_doc.get("version"),
+                "file": model_doc.get("file"),
+                "created_at": model_doc.get("created_at"),
+                "records_used": model_doc.get("records_used"),
+                "description": model_doc.get("description", "-"),
+                "source_collection": model_doc.get("source_collection", "-"),
+                "training_type": model_doc.get("training_type", "-"),
+                # "sample_preview": model_doc.get("sample_preview", []),
+                "active": model_doc.get("active", False),
             }
 
-    # fallback to file metadata
+    except Exception as e:
+        import logging
+        logging.exception("Failed to fetch model info from Firestore: %s", e)
+
+    # Fallback: use the active file on disk
     return {
         "version": None,
         "file": MODEL_PATH.name,
         "created_at": datetime.fromtimestamp(MODEL_PATH.stat().st_mtime).isoformat(),
         "records_used": None,
-        "description": "Unknown (no metadata)"
+        "description": "Active local model (no metadata)",
+        "active": True,
     }
 
 
@@ -443,6 +666,8 @@ def rollback_to_version(version: int):
         "file": file.name,
         "rolled_back_at": datetime.utcnow().isoformat(),
         "description": f"Rolled back to v{version}",
+        "active": True,
+        "activated_at": datetime.utcnow().isoformat()
     })
 
     return version

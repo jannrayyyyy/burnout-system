@@ -34,14 +34,28 @@ def export_responses_csv(upload_to_storage: bool = False) -> Optional[dict]:
     """
     try:
         rows = []
-        docs = db.collection("survey_responses").stream()
-        for doc in docs:
-            d = doc.to_dict()
-            # flatten: include 'prediction' at top-level if present
-            if "data" in d:
-                r = d["data"].copy()
-                r["prediction"] = d.get("prediction")
-                r["created_at"] = d.get("created_at")
+        # Combine both canonical collections to ensure exported data is comprehensive
+        for collection in ("survey_responses", "trained_surveys"):
+            docs = db.collection(collection).stream()
+            for doc in docs:
+                d = doc.to_dict() or {}
+                # Keep nested `data` shape when present, else flatten top-level fields
+                if "data" in d and isinstance(d["data"], dict):
+                    r = d["data"].copy()
+                else:
+                    r = {k: v for k, v in d.items() if k != "id"}
+
+                # attach prediction and created_at consistently
+                if "prediction" in d:
+                    r["prediction"] = d.get("prediction")
+                if "created_at" in d:
+                    # normalize to ISO string if it's a datetime-like object
+                    ca = d.get("created_at")
+                    try:
+                        r["created_at"] = ca.isoformat() if hasattr(ca, "isoformat") else str(ca)
+                    except Exception:
+                        r["created_at"] = str(ca)
+
                 rows.append(r)
 
         if not rows:
@@ -49,8 +63,10 @@ def export_responses_csv(upload_to_storage: bool = False) -> Optional[dict]:
 
         df = pd.DataFrame(rows)
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
-        df.to_csv(tmp.name, index=False)
-        tmp.close()
+        try:
+            df.to_csv(tmp.name, index=False)
+        finally:
+            tmp.close()
 
         # If upload to storage requested and configured, upload and return public URL
         if upload_to_storage and bucket:
@@ -72,6 +88,7 @@ def export_responses_csv(upload_to_storage: bool = False) -> Optional[dict]:
             return {"storage_url": public_url, "filename": filename}
 
         # Otherwise return a FileResponse (useful for direct download via API)
+        # Return FileResponse but ensure the file is removed by the caller after delivery if desired.
         return {"file_response": FileResponse(tmp.name, filename="survey_responses.csv", media_type="text/csv")}
     except Exception as e:
         logger.exception("Failed to export responses to CSV")

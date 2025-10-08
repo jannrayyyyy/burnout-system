@@ -75,24 +75,51 @@ def retrain_model(
 ):
     _require_admin(x_admin_secret)
 
+    # Fetch all available responses (both trained + untrained)
     rows = fetch_all_responses()
     if not rows:
         raise HTTPException(status_code=400, detail="No data available to retrain")
 
-    try:
-        df = pd.DataFrame([r["data"] | {"prediction": r.get("prediction")} for r in rows if "data" in r])
-    except Exception:
-        # fallback if data shapes differ
-        df = pd.DataFrame([r.get("data") or r for r in rows])
+    # Normalize all rows into a consistent structure
+    data_list = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
 
+        # Handle both "data" subfield or top-level data
+        if "data" in r and isinstance(r["data"], dict):
+            entry = r["data"].copy()
+        else:
+            entry = {k: v for k, v in r.items() if k != "id"}
+
+        # Attach prediction if available
+        if "prediction" in r:
+            entry["prediction"] = r.get("prediction")
+
+        data_list.append(entry)
+
+    if not data_list:
+        raise HTTPException(status_code=400, detail="No valid data entries found for retraining")
+
+    # Convert to DataFrame safely
+    try:
+        df = pd.DataFrame(data_list)
+        if df.empty:
+            raise ValueError("Empty DataFrame after parsing rows")
+    except Exception as e:
+        logger.exception("Failed to build DataFrame for retraining")
+        raise HTTPException(status_code=500, detail=f"Data parsing failed: {e}")
+
+    # Attempt retrain
     try:
         version, count = retrain_from_dataframe(df, description=description)
     except Exception as e:
         logger.exception("Failed to retrain model")
         raise HTTPException(status_code=500, detail=str(e))
 
+    # Return success response
     return {
-        "message": "Model retrained",
+        "message": "Model retrained successfully",
         "version": version,
         "records_used": count,
         "retrained_at": datetime.utcnow().isoformat(),
@@ -135,7 +162,6 @@ def model_info(x_admin_secret: str = Header(None)):
 # 📦 List Models
 # ===============================
 
-@router.get("/admin/models")
 @router.get("/admin/models")
 def list_models(x_admin_secret: str = Header(None)):
     """
@@ -235,7 +261,6 @@ def rollback(version: int, x_admin_secret: str = Header(None)):
 # ===============================
 @router.get("/admin/current")
 def current_model(x_admin_secret: str = Header(None)):
- def current_model(x_admin_secret: str = Header(None)):
     """
     Return current active model metadata, safely JSON-compliant.
     If no model is found, returns an empty payload instead of error.
@@ -263,12 +288,12 @@ def current_model(x_admin_secret: str = Header(None)):
         return v
 
     if not info:
-        return {"message": "No active model found", "version": None}
+        return {"message": "No active model found"}
 
     try:
         safe_info = {k: _safe_value(v) for k, v in info.items()}
     except Exception:
-        safe_info = {"message": "Invalid model metadata", "version": None}
+        safe_info = {"message": "Invalid model metadata"}
 
     # Validate JSON compliance
     import json
@@ -291,11 +316,25 @@ def model_data(version: int, x_admin_secret: str = Header(None)):
     if not rows:
         raise HTTPException(status_code=404, detail="No data available")
 
-    df = pd.DataFrame([r["data"] | {"prediction": r.get("prediction")} for r in rows if "data" in r])
+    # Build DataFrame safely: each row may have 'data' nested dict; include prediction if present
+    records = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if "data" in r and isinstance(r["data"], dict):
+            rec = r["data"].copy()
+        else:
+            rec = {k: v for k, v in r.items() if k != "id"}
+        if "prediction" in r:
+            rec["prediction"] = r.get("prediction")
+        records.append(rec)
+
+    if not records:
+        return JSONResponse({"version": version, "preview_count": 0, "preview": []})
+
+    df = pd.DataFrame(records)
     preview = df.head(50).to_dict(orient="records")
     return JSONResponse({"version": version, "preview_count": len(preview), "preview": preview})
-
-
 # ===============================
 # 📝 Add Survey (without prediction)
 # ===============================
