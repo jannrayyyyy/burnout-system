@@ -27,25 +27,15 @@ def predict(payload: InputPayload):
 
 @router.post("/submit")
 def submit(payload: InputPayload):
-    """Submit a survey, run prediction, and save to Firebase (both survey_responses + untrained_surveys)."""
-    # Validate required fields before prediction
+    """Submit a survey, run prediction, and save to Firebase (single entry)."""
     missing = [f for f in REQUIRED if f not in payload.data]
     if missing:
         raise HTTPException(status_code=400, detail={"missing": missing})
 
-    result = run_prediction(payload.data)
-
-    # Save to canonical survey_responses collection. run_prediction already logs an
-    # entry into `untrained_surveys` with prediction metadata, so avoid duplicating that.
+    # run_prediction already logs prediction into Firestore
     try:
-        db.collection("survey_responses").add({
-            "data": payload.data,
-            "prediction": result.get("burnout_level"),
-            "probability": result.get("probability"),
-            "created_at": datetime.utcnow().isoformat(),
-        })
-    except Exception:
-        # don't fail the API if saving to Firestore fails; warn instead
-        raise HTTPException(status_code=500, detail="Failed to save survey to database")
+        result = run_prediction(payload.data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
     return {"message": "Survey submitted", **result}

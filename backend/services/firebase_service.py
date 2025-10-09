@@ -12,20 +12,30 @@ if key_b64 and not KEY_PATH.exists():
     decoded = base64.b64decode(key_b64.encode("utf-8"))
     KEY_PATH.write_bytes(decoded)
 
-if not KEY_PATH.exists():
-    raise RuntimeError("Missing firebase_key.json. Place it in backend/ or set FIREBASE_KEY_BASE64 env.")
+# Allow overriding key path via env
+env_key_path = os.getenv("FIREBASE_KEY_PATH")
+if env_key_path:
+    env_p = Path(env_key_path)
+    if env_p.exists():
+        KEY_PATH = env_p
 
-cred = credentials.Certificate(str(KEY_PATH))
-# Initialize app only once
-if not firebase_admin._apps:
-    firebase_admin.initialize_app(cred)
-
-db = firestore.client()
+# If key is missing, don't crash app at import time. Downstream code should handle db==None.
+if KEY_PATH.exists():
+    cred = credentials.Certificate(str(KEY_PATH))
+    # Initialize app only once
+    try:
+        firebase_admin.get_app()
+    except Exception:
+        firebase_admin.initialize_app(cred)
+    db = firestore.client()
+else:
+    print("⚠️ firebase_key.json not found and FIREBASE_KEY_BASE64 not set. Firebase disabled.")
+    db = None
 
 # Storage (optional)
 FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET")  # e.g. "your-bucket.appspot.com"
 bucket = None
-if FIREBASE_STORAGE_BUCKET:
+if FIREBASE_STORAGE_BUCKET and db is not None:
     try:
         bucket = storage.bucket(FIREBASE_STORAGE_BUCKET)
     except Exception as e:

@@ -70,7 +70,7 @@ def _build_pipeline() -> Pipeline:
 def run_prediction(data: dict):
     """
     Run burnout prediction using the active model.
-    Cleans input, aligns with training features, stores a consistent untrained_surveys record,
+    Cleans input, aligns with training features, stores a consistent surveys record,
     and returns a structured explanation and probabilities.
     """
     import pandas as pd
@@ -106,11 +106,29 @@ def run_prediction(data: dict):
     # Keep only valid model features
     clean_data = {k: v for k, v in clean_data.items() if k in MODEL_FEATURES}
 
-    # Step 3: Prepare DataFrame
+    # Step 3: Ensure all MODEL_FEATURES exist and coerce types to avoid NaNs
+    for feat in MODEL_FEATURES:
+        if feat not in clean_data:
+            clean_data[feat] = None
+
     df = pd.DataFrame([clean_data])
 
+    # Coerce numeric-like columns to numeric (except gender)
+    numeric_cols = [c for c in MODEL_FEATURES if c != "gender"]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Fill missing numeric values with 0 (safe default) and gender with 'unknown'
+    df[numeric_cols] = df[numeric_cols].fillna(0)
+    if "gender" in df.columns:
+        df["gender"] = df["gender"].fillna("unknown").astype(str)
+
     # Step 4: Run prediction
-    proba = clf_pipeline.predict_proba(df)[0]
+    try:
+        proba = clf_pipeline.predict_proba(df)[0]
+    except Exception as e:
+        logger.exception("Prediction failed — input shape/type mismatch")
+        raise RuntimeError(f"Prediction failed: {e}")
     classes = clf_pipeline.classes_
     best_idx = int(proba.argmax())
     best_class = str(classes[best_idx])
@@ -118,17 +136,17 @@ def run_prediction(data: dict):
 
     # Step 5: Log the prediction for retraining later.
     # Save a consistent document shape: keep raw survey under `data` and attach prediction metadata.
+    # Persist prediction into unified 'surveys' collection when possible
     try:
-        db.collection("untrained_surveys").add({
-            "data": clean_data,
-            "prediction": best_class,
-            "probability": best_prob,
-            "created_at": datetime.utcnow().isoformat(),
-            "status": "predicted",
-        })
+        if db is not None:
+            db.collection("surveys").add({
+                "data": clean_data,
+                "created_at": datetime.utcnow().isoformat(),
+                "status": "predicted",
+            })
     except Exception:
         # Don't fail prediction if logging to Firestore fails; just warn.
-        logger.exception("Failed to write prediction to untrained_surveys")
+        logger.exception("Failed to write prediction to surveys collection")
 
     # Step 6: Model explainability
     model_info = get_current_model_info() or {}
@@ -236,7 +254,7 @@ def run_prediction(data: dict):
 # ---------------------
 def train_from_untrained(description: str = "Initial trained model") -> Tuple[int, int]:
     """
-    Train a model using data from `untrained_surveys`.
+    Train a model using data from the `surveys` collection.
     - If no model exists, bootstraps an initial unsupervised model using KMeans clustering.
     - If labels (prediction/burnout_level) exist, performs supervised training.
     - If a model already exists, refuses and instructs to use retrain.
@@ -410,15 +428,17 @@ def train_from_untrained(description: str = "Initial trained model") -> Tuple[in
     joblib.dump(pipeline, MODEL_PATH)
     clf_pipeline = pipeline
 
-    # Move docs: mark as trained
+    # Mark documents as trained in the unified 'surveys' collection
     for doc_id, orig in docs:
         try:
-            orig["trained_at"] = datetime.utcnow().isoformat()
-            orig["model_version"] = version
-            db.collection("trained_surveys").add(orig)
-            db.collection("untrained_surveys").document(doc_id).delete()
+            if db is not None:
+                db.collection("surveys").document(doc_id).update({
+                    "trained_at": datetime.utcnow().isoformat(),
+                    "model_version": version,
+                    "status": "trained",
+                })
         except Exception:
-            logger.exception(f"Failed to move doc {doc_id} to trained_surveys")
+            logger.exception(f"Failed to mark doc {doc_id} as trained")
 
     # Save metadata to Firestore
     sample_preview = df.head(10).to_dict(orient="records")
@@ -428,7 +448,7 @@ def train_from_untrained(description: str = "Initial trained model") -> Tuple[in
         "created_at": datetime.utcnow().isoformat(),
         "records_used": len(df),
         "description": description,
-        "source_collection": "untrained_surveys",
+        "source_collection": "surveys",
         "training_type": "unsupervised" if not label_cols else "supervised",
         "sample_preview": sample_preview,
         "active": True,
@@ -447,6 +467,7 @@ def retrain_from_dataframe(df: pd.DataFrame, description: str = "Retrained model
     """
     Retrain model using provided dataframe.
     If 'prediction' is missing, pseudo-label using current model.
+    Ensures consistent preprocessing schema to prevent NaN predictions.
     """
     if df.empty:
         raise ValueError("No data available for retraining")
@@ -463,47 +484,54 @@ def retrain_from_dataframe(df: pd.DataFrame, description: str = "Retrained model
             if col not in ["id", "created_at", "timestamp", "status", "trained_at", "model_version"]
         ]
 
-        # Coerce non-numeric columns to string before predicting
         df_pred = df.copy()
         for col in feature_columns:
             if df_pred[col].dtype == "object":
                 df_pred[col] = df_pred[col].astype(str)
 
+        # Use existing model to predict pseudo-labels
         df["prediction"] = clf_pipeline.predict(df_pred[feature_columns])
 
-    # --- Prepare training data ---
-    X = df.drop(columns=["prediction"], errors="ignore").copy()
-    y = df["prediction"].astype(str).copy()
+    # --- Align features to the training schema ---
+    MODEL_FEATURES = [
+        "age", "gender", "gwa", "hours_online", "motivation",
+        "num_subjects", "perceived_stress", "procrastination",
+        "sleep_hours", "study_hours", "year_level"
+    ]
 
-    drop_cols = ["created_at", "status", "timestamp", "trained_at", "model_version", "id"]
-    X = X.drop(columns=[c for c in drop_cols if c in X.columns])
+    # Normalize field names
+    alias_map = {
+        "num_subject": "num_subjects",
+        "subjects": "num_subjects",
+        "hours": "hours_online",
+        "perceived": "perceived_stress",
+        "procrastination_level": "procrastination",
+        "study": "study_hours",
+        "sleep": "sleep_hours"
+    }
 
-    # --- Convert to numeric where possible ---
-    for col in X.columns:
-        if col != "gender":
-            X[col] = pd.to_numeric(X[col], errors="coerce")
+    clean_records = []
+    for _, row in df.iterrows():
+        clean = {}
+        for k, v in row.items():
+            key = alias_map.get(str(k).strip().lower(), str(k).strip().lower())
+            clean[key] = v
+        clean_records.append(clean)
 
-    numeric_df = X.select_dtypes(include=[np.number])
-    if "gender" in X.columns:
-        X_clean = pd.concat([X["gender"], numeric_df], axis=1)
-    else:
-        X_clean = numeric_df
+    clean_df = pd.DataFrame(clean_records)
 
-    # --- Clean NaNs and constants ---
-    X_clean = X_clean.dropna(axis=1, how="all")
-    if X_clean.empty:
-        raise ValueError("No usable feature columns found for retraining.")
+    # Keep only model features + label
+    label_col = "prediction"
+    for feat in MODEL_FEATURES:
+        if feat not in clean_df.columns:
+            clean_df[feat] = np.nan
 
-    from sklearn.impute import SimpleImputer
-    numeric_cols = X_clean.select_dtypes(include=[np.number]).columns
-    if len(numeric_cols) > 0:
-        X_clean[numeric_cols] = SimpleImputer(strategy="median").fit_transform(X_clean[numeric_cols])
-    if "gender" in X_clean.columns:
-        X_clean["gender"] = X_clean["gender"].fillna("unknown")
+    X = clean_df[MODEL_FEATURES].copy()
+    y = clean_df[label_col].astype(str).copy()
 
-    # --- Train new pipeline ---
+    # --- Train new pipeline using same preprocessing ---
     pipeline = _build_pipeline()
-    pipeline.fit(X_clean, y)
+    pipeline.fit(X, y)
 
     # --- Save new version ---
     existing = sorted(MODELS_DIR.glob("burnout_v*.pkl"))
@@ -514,13 +542,13 @@ def retrain_from_dataframe(df: pd.DataFrame, description: str = "Retrained model
     joblib.dump(pipeline, MODEL_PATH)
     clf_pipeline = pipeline
 
-    # --- Update Firestore ---
-    sample_preview = df.head(10).to_dict(orient="records")
+    # --- Log metadata ---
+    sample_preview = clean_df.head(10).to_dict(orient="records")
     meta = {
         "version": version,
         "file": version_file.name,
         "created_at": datetime.utcnow().isoformat(),
-        "records_used": len(df),
+        "records_used": len(clean_df),
         "description": description,
         "source_collection": "retrain_from_dataframe",
         "training_type": "retrain",
@@ -528,24 +556,28 @@ def retrain_from_dataframe(df: pd.DataFrame, description: str = "Retrained model
         "active": True,
         "activated_at": datetime.utcnow().isoformat()
     }
-    db.collection("models").add(meta)
 
-    logger.info(f"Model v{version} retrained successfully on {len(df)} records.")
+    if db is not None:
+        db.collection("models").add(meta)
 
-    return version, len(df)
-
+    logger.info(f"Model v{version} retrained successfully on {len(clean_df)} records.")
+    return version, len(clean_df)
 
 
 # ---------------------
 # 4) Add survey without prediction
 # ---------------------
 def add_survey_without_prediction(data: dict):
-    db.collection("untrained_surveys").add({
-        **data,
-        "created_at": datetime.utcnow().isoformat(),
-        "status": "untrained"
-    })
-    return {"message": "Survey added without prediction."}
+    if db is not None:
+        db.collection("surveys").add({
+            "data": data,
+            "created_at": datetime.utcnow().isoformat(),
+            "status": "untrained"
+        })
+        return {"message": "Survey added without prediction."}
+    else:
+        # fallback to local acknowledgement when Firebase is disabled
+        return {"message": "Firebase not configured; survey received locally."}
 
 
 # ---------------------
@@ -560,13 +592,15 @@ def hard_reset():
             logger.exception(f"Failed to delete model file {p}")
 
     # delete Firebase data
-    for col in ["models", "trained_surveys", "untrained_surveys"]:
-        docs = db.collection(col).stream()
-        for doc in docs:
-            try:
-                db.collection(col).document(doc.id).delete()
-            except Exception:
-                logger.exception(f"Failed to delete doc {doc.id} from {col}")
+    # delete Firebase data
+    if db is not None:
+        for col in ["models", "surveys"]:
+            docs = db.collection(col).stream()
+            for doc in docs:
+                try:
+                    db.collection(col).document(doc.id).delete()
+                except Exception:
+                    logger.exception(f"Failed to delete doc {doc.id} from {col}")
 
     global clf_pipeline
     clf_pipeline = None

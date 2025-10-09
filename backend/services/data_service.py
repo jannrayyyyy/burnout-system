@@ -12,17 +12,29 @@ logger = logging.getLogger(__name__)
 
 def fetch_all_responses():
     """
-    Returns all documents in `untrained_surveys` as a list of dicts.
+    Returns all documents in the unified `surveys` collection as a list of dicts.
+    Falls back to empty list if Firebase is not configured.
     """
-    docs = db.collection("untrained_surveys").stream()
+    if db is None:
+        return []
+    docs = db.collection("surveys").stream()
     return [doc.to_dict() for doc in docs]
 
 def fetch_untrained_documents():
     """
-    Returns list of (doc_id, data) for untrained_surveys.
+    Returns list of (doc_id, data) for documents in `surveys` that are not marked trained.
+    Each document is returned as (doc_id, dict).
     """
-    docs = db.collection("untrained_surveys").stream()
-    return [(doc.id, doc.to_dict()) for doc in docs]
+    if db is None:
+        return []
+    docs = db.collection("surveys").stream()
+    out = []
+    for doc in docs:
+        d = doc.to_dict() or {}
+        # consider documents without 'status' or with status != 'trained' as untrained
+        if d.get("status") != "trained":
+            out.append((doc.id, d))
+    return out
 
 def export_responses_csv(upload_to_storage: bool = False) -> Optional[dict]:
     """
@@ -34,10 +46,11 @@ def export_responses_csv(upload_to_storage: bool = False) -> Optional[dict]:
     """
     try:
         rows = []
-        # Combine both canonical collections to ensure exported data is comprehensive
-        for collection in ("survey_responses", "trained_surveys"):
-            docs = db.collection(collection).stream()
-            for doc in docs:
+        # Single canonical collection 'surveys'
+        if db is None:
+            return None
+        docs = db.collection("surveys").stream()
+        for doc in docs:
                 d = doc.to_dict() or {}
                 # Keep nested `data` shape when present, else flatten top-level fields
                 if "data" in d and isinstance(d["data"], dict):
