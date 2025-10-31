@@ -9,3 +9,8 @@ sqlalchemy
 pydantic
 imbalanced-learn
 python-multipart
+scipy
+seaborn
+matplotlib
+google-cloud-storage
+google-cloud-firestore
