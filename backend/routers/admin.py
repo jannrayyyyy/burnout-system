@@ -6,6 +6,12 @@ from datetime import datetime
 import pandas as pd
 import os
 import logging
+from google.cloud.firestore import DocumentSnapshot
+from google.cloud.firestore_v1 import SERVER_TIMESTAMP
+
+from backend.services.data_service import export_responses_csv, fetch_all_responses
+from backend.services.training_service import train_from_csv  # <-- new training logic here
+from backend.services.firebase_service import db
 
 from backend.services.data_service import export_responses_csv, fetch_all_responses
 from backend.services.model_service import (
@@ -16,13 +22,9 @@ from backend.services.model_service import (
     add_survey_without_prediction,
     get_current_model_info,
     hard_reset,
-    train_from_untrained,
 )
-from backend.services.firebase_service import db
 
 from datetime import datetime
-from google.cloud.firestore import DocumentSnapshot
-from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -47,21 +49,22 @@ def train_model(
 ):
     _require_admin(x_admin_secret)
     try:
-        version, count = train_from_untrained(description=description)
+        result = train_from_csv(description=description)
         return {
             "message": "Model trained successfully",
-            "version": version,
-            "records_used": count,
+            "version": result["version"],
+            "records_used": result["records_used"],
+            "accuracy": result["accuracy"],
+            "passed": result["passed"],
             "trained_at": datetime.utcnow().isoformat(),
             "description": description,
         }
     except RuntimeError as e:
-        # For example: model already exists
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.exception("Unexpected error in /admin/train")
+        logging.exception("Unexpected error in /admin/train")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -128,7 +131,7 @@ def retrain_model(
 
 
 # ===============================
-# 📤 Export Data
+# Export Data
 # ===============================
 @router.get("/admin/export")
 def export_csv(upload_to_storage: bool = Query(False), x_admin_secret: str = Header(None)):
@@ -144,7 +147,7 @@ def export_csv(upload_to_storage: bool = Query(False), x_admin_secret: str = Hea
 
 
 # ===============================
-# 📊 Model Info
+# Model Info
 # ===============================
 @router.get("/admin/info")
 def model_info(x_admin_secret: str = Header(None)):

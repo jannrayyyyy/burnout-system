@@ -33,7 +33,7 @@ else:
     db = None
 
 # Storage (optional)
-FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET")  # e.g. "your-bucket.appspot.com"
+FIREBASE_STORAGE_BUCKET = "burnout-system.firebasestorage.app"  # e.g. "your-bucket.appspot.com"
 bucket = None
 if FIREBASE_STORAGE_BUCKET and db is not None:
     try:
