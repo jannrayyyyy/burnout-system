@@ -363,17 +363,38 @@ def add_survey_without_prediction(data: dict):
 
 
 def hard_reset():
-    
+    """Completely resets local files, Firestore data, and Firebase Storage folders."""
+
+    # --- 1. Delete local model files (.pkl) ---
     for p in MODELS_DIR.glob("*.pkl"):
         try:
             p.unlink(missing_ok=True)
         except Exception:
             logger.exception(f"Failed to delete model file {p}")
 
-    
-    
+    # --- 2. Delete everything in data/ except burnout.data ---
+    try:
+        data_dir = Path("data")
+        for file in data_dir.iterdir():
+            if file.is_file() and file.name != "burnout_data.csv":
+                try:
+                    file.unlink()
+                except Exception:
+                    logger.exception(f"Failed to delete data file {file}")
+            elif file.is_dir():
+                try:
+                    shutil.rmtree(file)
+                except Exception:
+                    logger.exception(f"Failed to delete directory {file}")
+
+        logger.info("🧹 Cleaned local data folder (kept burnout.data).")
+
+    except Exception as e:
+        logger.exception(f"Failed to clean data folder: {e}")
+
+    # --- 3. Delete Firestore collections ---
     if db is not None:
-        for col in ["models", "surveys"]:
+        for col in ["models", "surveys", "frontend_requests", "raw_forms", "predictions"]:
             docs = db.collection(col).stream()
             for doc in docs:
                 try:
@@ -381,10 +402,33 @@ def hard_reset():
                 except Exception:
                     logger.exception(f"Failed to delete doc {doc.id} from {col}")
 
+    # --- 4. Delete Firebase Storage folders ---
+    try:
+        from firebase_admin import storage
+        import shutil
+
+        bucket = storage.bucket()
+        folders_to_delete = ["datasets", "models", "visualizations"]
+
+        for folder in folders_to_delete:
+            blobs = list(bucket.list_blobs(prefix=f"{folder}/"))
+            for blob in blobs:
+                try:
+                    blob.delete()
+                except Exception:
+                    logger.exception(f"Failed to delete blob {blob.name} in folder {folder}")
+
+            logger.info(f"🗑️ Deleted folder '{folder}' from Firebase Storage ({len(blobs)} files removed).")
+
+    except Exception as e:
+        logger.exception(f"Failed to clean Firebase Storage: {e}")
+
+    # --- 5. Reset global state ---
     global clf_pipeline
     clf_pipeline = None
 
-    return {"message": "All models and Firebase data have been deleted."}
+    return {"message": "All models, local data, Firebase data, and storage folders have been deleted (burnout.data preserved)."}
+
 
 
 def get_current_model_info():
