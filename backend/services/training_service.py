@@ -17,6 +17,7 @@ import numpy as np
 import joblib
 import io
 import json
+import requests  # ADD THIS IMPORT
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -63,6 +64,48 @@ COLOR_PALETTE = {
     'success': '#388E3C',
     'neutral': '#757575'
 }
+
+
+def load_csv_from_url_or_path(source):
+    """
+    Load CSV from either a URL or local file path.
+    
+    Args:
+        source: Either a URL (str starting with http/https) or file path (str/Path)
+        
+    Returns:
+        pandas DataFrame
+    """
+    logger.info(f"📥 Loading data from: {source}")
+    
+    if isinstance(source, str) and (source.startswith('http://') or source.startswith('https://')):
+        # Load from URL
+        try:
+            logger.info("🌐 Detected URL, downloading CSV...")
+            response = requests.get(source, timeout=30)
+            response.raise_for_status()  # Raise error for bad status codes
+            
+            # Read CSV from response content
+            df = pd.read_csv(io.StringIO(response.text))
+            logger.info(f"✅ Successfully loaded CSV from URL: {len(df)} rows")
+            return df
+            
+        except requests.RequestException as e:
+            logger.error(f"❌ Failed to download CSV from URL: {e}")
+            raise ValueError(f"Unable to download CSV from URL: {source}. Error: {str(e)}")
+        except pd.errors.ParserError as e:
+            logger.error(f"❌ Failed to parse CSV from URL: {e}")
+            raise ValueError(f"Invalid CSV format at URL: {source}")
+    else:
+        # Load from local file
+        file_path = Path(source)
+        if not file_path.exists():
+            raise FileNotFoundError(f"Dataset not found: {file_path}")
+        
+        logger.info(f"📂 Loading from local file: {file_path}")
+        df = pd.read_csv(file_path)
+        logger.info(f"✅ Successfully loaded CSV from file: {len(df)} rows")
+        return df
 
 
 def convert_to_native_types(obj):
@@ -398,9 +441,14 @@ def calculate_metrics(y_test, y_pred, y_proba=None):
     return metrics
 
 
-def train_from_csv(description: str = "Burnout prediction model trained on student survey data"):
+def train_from_csv(description: str = "Burnout prediction model trained on student survey data", 
+                   csv_source: str = None):
     """
     Main training pipeline for burnout prediction.
+    
+    Args:
+        description: Model description
+        csv_source: Either a URL or file path to the CSV. If None, uses default DATA_PATH
     
     Process:
     1. Load and clean data
@@ -412,9 +460,9 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
     """
     
     try:
-        if not DATA_PATH.exists():
-            raise FileNotFoundError(f"Dataset not found: {DATA_PATH}")
-
+        # Use provided CSV source or default
+        data_source = csv_source if csv_source else str(DATA_PATH)
+        
         # ========== PHASE 0: DEACTIVATE PREVIOUS MODELS ==========
         deactivate_previous_models()
 
@@ -423,7 +471,8 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
         logger.info("🚀 STARTING BURNOUT PREDICTION TRAINING PIPELINE")
         logger.info("=" * 80)
         
-        df_original = pd.read_csv(DATA_PATH)
+        # Use the new function to load from URL or path
+        df_original = load_csv_from_url_or_path(data_source)
         original_row_count = len(df_original)
         logger.info(f"📂 Loaded dataset: {original_row_count} rows × {df_original.shape[1]} columns")
         
@@ -661,6 +710,7 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
             'version': version,
             'trained_at': datetime.utcnow(),
             'description': description,
+            'data_source': data_source,  # Track where data came from
             'best_model': best_model_name,
             'accuracy': float(best_accuracy),
             'metrics': metrics,
@@ -700,6 +750,7 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
             'cv_scores': cv_scores,
             'important_features': important_features[:10],
             'urls': urls,
+            'data_source': data_source,
             'original_row_count': original_row_count,
             'records_used': len(X),
             'n_features': X_scaled.shape[1],
@@ -717,6 +768,7 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
         logger.info(f"📈 Original Records: {original_row_count}")
         logger.info(f"✅ Records Used: {len(X)}")
         logger.info(f"🔢 Features: {X_scaled.shape[1]} survey questions")
+        logger.info(f"📥 Data Source: {data_source}")
         logger.info(f"🟢 Status: Active")
         logger.info("=" * 80)
 
@@ -734,6 +786,7 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
                     'error': str(e),
                     'active': False,
                     'description': description,
+                    'data_source': csv_source if csv_source else str(DATA_PATH),
                     'passed': False
                 }
                 db.collection('models').add(failure_record)
@@ -871,6 +924,7 @@ def predict_burnout(input_data):
 
 # For testing/debugging
 if __name__ == "__main__":
-    # Test training
-    result = train_from_csv("Test training run")
+    # Test training with URL
+    firebase_url = "https://firebasestorage.googleapis.com/v0/b/burnout-system.firebasestorage.app/o/csv%2Fburnout_data.csv?alt=media&token=ffd5823b-5880-43bf-8a2d-d84c7db58522"
+    result = train_from_csv("Test training run with Firebase URL", csv_source=firebase_url)
     print(json.dumps(convert_to_native_types(result), indent=2))
