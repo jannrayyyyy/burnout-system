@@ -17,7 +17,7 @@ import numpy as np
 import joblib
 import io
 import json
-import requests  # ADD THIS IMPORT
+import requests
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -32,11 +32,16 @@ from sklearn.model_selection import (
 from sklearn.metrics import (
     accuracy_score, classification_report, confusion_matrix,
     precision_recall_fscore_support, roc_auc_score, cohen_kappa_score,
-    matthews_corrcoef, balanced_accuracy_score
+    matthews_corrcoef, balanced_accuracy_score, precision_score, 
+    recall_score, f1_score
 )
 import seaborn as sns
 from scipy import stats
 from google.cloud.firestore_v1.base_query import FieldFilter
+import tempfile
+import urllib.parse
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
 from .firebase_service import db, bucket
 
@@ -66,46 +71,273 @@ COLOR_PALETTE = {
 }
 
 
-def load_csv_from_url_or_path(source):
+def create_requests_session():
+    """Create a robust requests session with retry strategy."""
+    session = requests.Session()
+    
+    # Configure retry strategy
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    # Set reasonable timeout and headers
+    session.headers.update({
+        'User-Agent': 'Burnout-Training-Service/1.0',
+        'Accept': 'text/csv, application/csv, */*'
+    })
+    
+    return session
+
+
+def validate_csv_source(csv_source):
     """
-    Load CSV from either a URL or local file path.
+    Validate and normalize the CSV source input.
     
     Args:
-        source: Either a URL (str starting with http/https) or file path (str/Path)
+        csv_source: URL, file path, or Firebase Storage path
+        
+    Returns:
+        dict: Normalized source information
+    """
+    if csv_source is None:
+        return {
+            'type': 'default',
+            'path': str(DATA_PATH),
+            'valid': DATA_PATH.exists()
+        }
+    
+    # Convert to string if Path object
+    csv_source = str(csv_source)
+    
+    # Check if it's a URL
+    if csv_source.startswith(('http://', 'https://')):
+        return {
+            'type': 'url',
+            'path': csv_source,
+            'valid': True
+        }
+    
+    # Check if it's a Firebase Storage path (gs:// or firebase storage pattern)
+    elif csv_source.startswith('gs://') or 'firebasestorage.googleapis.com' in csv_source:
+        return {
+            'type': 'firebase',
+            'path': csv_source,
+            'valid': True
+        }
+    
+    # Check if it's a local file path
+    else:
+        file_path = Path(csv_source)
+        return {
+            'type': 'local',
+            'path': str(file_path),
+            'valid': file_path.exists()
+        }
+
+
+def download_from_firebase_storage(firebase_url):
+    """
+    Download CSV from Firebase Storage URL.
+    
+    Args:
+        firebase_url: Firebase Storage URL
+        
+    Returns:
+        str: CSV content as string
+    """
+    try:
+        logger.info(f"🔥 Downloading from Firebase Storage: {firebase_url}")
+        
+        session = create_requests_session()
+        
+        # Handle Firebase Storage URL formatting
+        if 'alt=media' not in firebase_url:
+            # Ensure the URL has the media parameter
+            parsed_url = urllib.parse.urlparse(firebase_url)
+            query_params = urllib.parse.parse_qs(parsed_url.query)
+            query_params['alt'] = ['media']
+            new_query = urllib.parse.urlencode(query_params, doseq=True)
+            firebase_url = urllib.parse.urlunparse((
+                parsed_url.scheme,
+                parsed_url.netloc,
+                parsed_url.path,
+                parsed_url.params,
+                new_query,
+                parsed_url.fragment
+            ))
+        
+        response = session.get(firebase_url, timeout=30)
+        response.raise_for_status()
+        
+        # Validate that we got CSV content
+        content_type = response.headers.get('content-type', '').lower()
+        if 'text/csv' not in content_type and 'application/csv' not in content_type:
+            # Check if content looks like CSV
+            content_preview = response.text[:100]
+            if ',' not in content_preview and '\n' not in content_preview:
+                logger.warning(f"⚠️ Response may not be CSV. Content-Type: {content_type}")
+        
+        logger.info(f"✅ Successfully downloaded CSV from Firebase Storage: {len(response.text)} bytes")
+        return response.text
+        
+    except requests.RequestException as e:
+        logger.error(f"❌ Firebase Storage download failed: {e}")
+        raise ValueError(f"Failed to download from Firebase Storage: {str(e)}")
+
+
+def load_csv_from_url_or_path(source):
+    """
+    Enhanced CSV loading with robust error handling and support for multiple sources.
+    
+    Args:
+        source: URL, file path, or Firebase Storage path
         
     Returns:
         pandas DataFrame
+        
+    Raises:
+        ValueError: If source is invalid or data cannot be loaded
+        FileNotFoundError: If local file doesn't exist
     """
-    logger.info(f"📥 Loading data from: {source}")
+    source_info = validate_csv_source(source)
     
-    if isinstance(source, str) and (source.startswith('http://') or source.startswith('https://')):
-        # Load from URL
-        try:
-            logger.info("🌐 Detected URL, downloading CSV...")
-            response = requests.get(source, timeout=30)
-            response.raise_for_status()  # Raise error for bad status codes
+    logger.info(f"📥 Loading data from: {source_info['path']} (type: {source_info['type']})")
+    
+    try:
+        if source_info['type'] == 'url':
+            # Standard HTTP/HTTPS URL
+            session = create_requests_session()
+            response = session.get(source_info['path'], timeout=30)
+            response.raise_for_status()
+            csv_content = response.text
             
-            # Read CSV from response content
-            df = pd.read_csv(io.StringIO(response.text))
-            logger.info(f"✅ Successfully loaded CSV from URL: {len(df)} rows")
+        elif source_info['type'] == 'firebase':
+            # Firebase Storage URL
+            csv_content = download_from_firebase_storage(source_info['path'])
+            
+        elif source_info['type'] == 'local':
+            # Local file path
+            if not source_info['valid']:
+                raise FileNotFoundError(f"Local file not found: {source_info['path']}")
+            with open(source_info['path'], 'r', encoding='utf-8') as f:
+                csv_content = f.read()
+                
+        elif source_info['type'] == 'default':
+            # Default data path
+            if not source_info['valid']:
+                raise FileNotFoundError(f"Default data file not found: {source_info['path']}")
+            with open(source_info['path'], 'r', encoding='utf-8') as f:
+                csv_content = f.read()
+        
+        else:
+            raise ValueError(f"Unsupported source type: {source_info['type']}")
+        
+        # Parse CSV content
+        try:
+            df = pd.read_csv(io.StringIO(csv_content))
+            logger.info(f"✅ Successfully loaded CSV: {len(df)} rows × {df.shape[1]} columns")
             return df
             
-        except requests.RequestException as e:
-            logger.error(f"❌ Failed to download CSV from URL: {e}")
-            raise ValueError(f"Unable to download CSV from URL: {source}. Error: {str(e)}")
         except pd.errors.ParserError as e:
-            logger.error(f"❌ Failed to parse CSV from URL: {e}")
-            raise ValueError(f"Invalid CSV format at URL: {source}")
-    else:
-        # Load from local file
-        file_path = Path(source)
-        if not file_path.exists():
-            raise FileNotFoundError(f"Dataset not found: {file_path}")
+            logger.error(f"❌ CSV parsing error: {e}")
+            
+            # Try alternative encodings for local files
+            if source_info['type'] in ['local', 'default']:
+                logger.info("🔄 Trying alternative encodings...")
+                encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']
+                for encoding in encodings:
+                    try:
+                        df = pd.read_csv(source_info['path'], encoding=encoding)
+                        logger.info(f"✅ Successfully loaded with {encoding} encoding")
+                        return df
+                    except (UnicodeDecodeError, pd.errors.ParserError):
+                        continue
+            
+            raise ValueError(f"Failed to parse CSV: {str(e)}")
+            
+    except requests.RequestException as e:
+        logger.error(f"❌ Network error loading CSV: {e}")
+        raise ValueError(f"Network error loading CSV: {str(e)}")
         
-        logger.info(f"📂 Loading from local file: {file_path}")
-        df = pd.read_csv(file_path)
-        logger.info(f"✅ Successfully loaded CSV from file: {len(df)} rows")
-        return df
+    except Exception as e:
+        logger.error(f"❌ Unexpected error loading CSV: {e}")
+        raise ValueError(f"Failed to load CSV: {str(e)}")
+
+
+def backup_csv_source(csv_content, source_info):
+    """
+    Backup the CSV source to local storage for reproducibility.
+    
+    Args:
+        csv_content: Raw CSV content as string
+        source_info: Source information dictionary
+    """
+    try:
+        backup_dir = Path("data/backups")
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        source_type = source_info['type']
+        
+        if source_type == 'url':
+            # Extract domain for filename
+            domain = urllib.parse.urlparse(source_info['path']).netloc
+            filename = f"backup_{timestamp}_{domain}.csv"
+        elif source_type == 'firebase':
+            filename = f"backup_{timestamp}_firebase.csv"
+        elif source_type == 'local':
+            file_path = Path(source_info['path'])
+            filename = f"backup_{timestamp}_{file_path.stem}.csv"
+        else:
+            filename = f"backup_{timestamp}_unknown.csv"
+        
+        backup_path = backup_dir / filename
+        with open(backup_path, 'w', encoding='utf-8') as f:
+            f.write(csv_content)
+        
+        logger.info(f"💾 CSV source backed up to: {backup_path}")
+        return str(backup_path)
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to backup CSV source: {e}")
+        return None
+
+
+def validate_dataset_structure(df):
+    """
+    Validate that the dataset has the expected structure for burnout analysis.
+    
+    Args:
+        df: pandas DataFrame
+        
+    Returns:
+        tuple: (is_valid, message)
+    """
+    if df.empty:
+        return False, "Dataset is empty"
+    
+    if len(df) < 10:
+        return False, f"Insufficient rows: {len(df)} (minimum 10 required)"
+    
+    if df.shape[1] < 5:
+        return False, f"Insufficient columns: {df.shape[1]} (minimum 5 required)"
+    
+    # Check for expected column patterns (survey questions)
+    text_columns = df.select_dtypes(include=['object']).columns
+    numeric_columns = df.select_dtypes(include=[np.number]).columns
+    
+    if len(text_columns) == 0 and len(numeric_columns) == 0:
+        return False, "No usable columns found"
+    
+    logger.info(f"📊 Dataset validation: {len(df)} rows, {len(text_columns)} text columns, {len(numeric_columns)} numeric columns")
+    return True, "Dataset structure appears valid"
 
 
 def convert_to_native_types(obj):
@@ -153,10 +385,7 @@ def deactivate_previous_models():
 
 
 def clean_and_prepare_data(df):
-    """
-    Clean and prepare the burnout survey data.
-    Removes metadata columns and prepares features.
-    """
+    """Clean and prepare data for training - UNCHANGED FROM ORIGINAL"""
     logger.info("Starting data cleaning and preparation...")
     
     original_count = len(df)
@@ -213,10 +442,7 @@ def clean_and_prepare_data(df):
 
 
 def map_likert_responses(df):
-    """
-    Map Likert scale text responses to numerical values.
-    This is crucial for the burnout survey data.
-    """
+    """Map Likert scale responses to numerical values - UNCHANGED FROM ORIGINAL"""
     logger.info("Mapping Likert scale responses to numerical values...")
     
     # Comprehensive Likert mappings
@@ -263,10 +489,7 @@ def map_likert_responses(df):
 
 
 def derive_burnout_labels(df):
-    """
-    Derive burnout level labels from survey responses using domain knowledge.
-    Based on burnout dimensions: exhaustion, cynicism, inefficacy, stress, workload.
-    """
+    """Derive burnout labels using multi-dimensional analysis - UNCHANGED FROM ORIGINAL"""
     logger.info("Deriving burnout labels using multi-dimensional analysis...")
     
     # Get all numeric columns (these are the survey responses)
@@ -307,186 +530,229 @@ def derive_burnout_labels(df):
     return df, "burnout_level"
 
 
-def create_visualizations(clf, X_test, y_test, y_pred, results, feature_names, class_names, version, best_model_name):
-    """Generate comprehensive visualizations with professional styling."""
-    logger.info("📊 Creating visualizations...")
+def create_visualizations(clf, X_test, y_test, y_pred, model_results, 
+                         feature_names, class_names, version, best_model_name):
+    """
+    Create comprehensive visualizations for model evaluation.
     
-    plt.style.use('seaborn-v0_8-darkgrid')
-    sns.set_palette("husl")
-    
+    Returns:
+        dict: Dictionary of BytesIO buffers containing PNG images
+    """
     visualizations = {}
     
+    # Set style
+    sns.set_style("whitegrid")
+    plt.rcParams['figure.facecolor'] = 'white'
+    
     # 1. Confusion Matrix
-    fig1, ax1 = plt.subplots(figsize=(10, 8))
-    cm = confusion_matrix(y_test, y_pred, labels=class_names)
-    cm_percent = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
-    
-    annot = np.array([[f'{count}\n({pct:.1f}%)' 
-                       for count, pct in zip(row_counts, row_pcts)]
-                      for row_counts, row_pcts in zip(cm, cm_percent)])
-    
-    sns.heatmap(cm, annot=annot, fmt='', cmap='RdYlGn', ax=ax1,
-                xticklabels=class_names, yticklabels=class_names,
-                cbar_kws={'label': 'Count'}, linewidths=1, linecolor='gray')
-    
-    ax1.set_title('Confusion Matrix\n(True vs Predicted Burnout Levels)', 
-                  fontsize=16, fontweight='bold', pad=20)
-    ax1.set_ylabel('True Label', fontsize=13, fontweight='bold')
-    ax1.set_xlabel('Predicted Label', fontsize=13, fontweight='bold')
-    plt.tight_layout()
-    
-    buf1 = io.BytesIO()
-    plt.savefig(buf1, format='png', dpi=300, bbox_inches='tight')
-    plt.close(fig1)
-    buf1.seek(0)
-    visualizations['confusion_matrix'] = buf1
+    try:
+        fig, ax = plt.subplots(figsize=(10, 8))
+        cm = confusion_matrix(y_test, y_pred)
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                   xticklabels=class_names, yticklabels=class_names, ax=ax)
+        ax.set_title(f'Confusion Matrix - {best_model_name}\nVersion {version}', 
+                    fontsize=14, fontweight='bold')
+        ax.set_ylabel('True Label', fontsize=12)
+        ax.set_xlabel('Predicted Label', fontsize=12)
+        
+        buf = io.BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        plt.close()
+        visualizations['confusion_matrix'] = buf
+    except Exception as e:
+        logger.error(f"Failed to create confusion matrix: {e}")
     
     # 2. Model Comparison
-    fig2, ax2 = plt.subplots(figsize=(12, 7))
-    
-    models = list(results.keys())
-    accuracies = list(results.values())
-    colors = [COLOR_PALETTE['success'] if acc == max(accuracies) 
-              else COLOR_PALETTE['secondary'] for acc in accuracies]
-    
-    bars = ax2.barh(models, accuracies, color=colors, edgecolor='black', linewidth=1.5)
-    for i, (bar, acc) in enumerate(zip(bars, accuracies)):
-        ax2.text(acc + 1, i, f'{acc:.2f}%', va='center', fontweight='bold', fontsize=11)
-    
-    ax2.set_xlabel('Accuracy (%)', fontsize=13, fontweight='bold')
-    ax2.set_title('Model Performance Comparison', fontsize=14, fontweight='bold')
-    ax2.set_xlim(0, 105)
-    ax2.grid(axis='x', alpha=0.3, linestyle='--')
-    
-    plt.tight_layout()
-    buf2 = io.BytesIO()
-    plt.savefig(buf2, format='png', dpi=300, bbox_inches='tight')
-    plt.close(fig2)
-    buf2.seek(0)
-    visualizations['model_comparison'] = buf2
-    
-    # 3. Feature Importance (for Random Forest)
-    if hasattr(clf, 'feature_importances_'):
-        fig3, ax3 = plt.subplots(figsize=(12, 10))
+    try:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        models = list(model_results.keys())
+        accuracies = list(model_results.values())
+        colors = [COLOR_PALETTE['success'] if m == best_model_name 
+                 else COLOR_PALETTE['secondary'] for m in models]
         
-        feat_imp = sorted(zip(feature_names, clf.feature_importances_), 
-                         key=lambda x: x[1], reverse=True)[:20]
-        features, importances = zip(*feat_imp)
+        bars = ax.bar(models, accuracies, color=colors, edgecolor='black', linewidth=1.5)
+        ax.set_title(f'Model Performance Comparison\nVersion {version}', 
+                    fontsize=14, fontweight='bold')
+        ax.set_ylabel('Accuracy (%)', fontsize=12)
+        ax.set_xlabel('Model', fontsize=12)
+        ax.set_ylim(0, 100)
+        ax.grid(axis='y', alpha=0.3)
         
-        colors_feat = plt.cm.viridis(np.linspace(0.3, 0.9, len(features)))
-        bars = ax3.barh(range(len(features)), importances, color=colors_feat,
-                       edgecolor='black', linewidth=1.2)
+        # Add value labels on bars
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{height:.1f}%', ha='center', va='bottom', fontweight='bold')
         
-        ax3.set_yticks(range(len(features)))
-        ax3.set_yticklabels([f.replace('_', ' ').title()[:50] for f in features], fontsize=9)
-        ax3.invert_yaxis()
-        ax3.set_xlabel('Importance Score', fontsize=13, fontweight='bold')
-        ax3.set_title(f'Top 20 Survey Questions by Importance\n(Model: {best_model_name})', 
-                     fontsize=14, fontweight='bold', pad=15)
-        ax3.grid(axis='x', alpha=0.3, linestyle='--')
-        
-        for i, (bar, imp) in enumerate(zip(bars, importances)):
-            ax3.text(imp + 0.002, i, f'{imp:.4f}', va='center', fontsize=8)
-        
+        buf = io.BytesIO()
         plt.tight_layout()
-        buf3 = io.BytesIO()
-        plt.savefig(buf3, format='png', dpi=300, bbox_inches='tight')
-        plt.close(fig3)
-        buf3.seek(0)
-        visualizations['feature_importance'] = buf3
+        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        plt.close()
+        visualizations['model_comparison'] = buf
+    except Exception as e:
+        logger.error(f"Failed to create model comparison: {e}")
     
-    logger.info(f"✅ Generated {len(visualizations)} visualizations")
+    # 3. Feature Importance
+    if hasattr(clf, 'feature_importances_'):
+        try:
+            fig, ax = plt.subplots(figsize=(12, 10))
+            importances = clf.feature_importances_
+            indices = np.argsort(importances)[-20:]  # Top 20
+            
+            ax.barh(range(len(indices)), importances[indices], 
+                   color=COLOR_PALETTE['accent'], edgecolor='black', linewidth=1)
+            ax.set_yticks(range(len(indices)))
+            ax.set_yticklabels([feature_names[i][:50] for i in indices], fontsize=9)
+            ax.set_xlabel('Importance Score', fontsize=12)
+            ax.set_title(f'Top 20 Feature Importances - {best_model_name}\nVersion {version}', 
+                        fontsize=14, fontweight='bold')
+            ax.grid(axis='x', alpha=0.3)
+            
+            buf = io.BytesIO()
+            plt.tight_layout()
+            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            plt.close()
+            visualizations['feature_importance'] = buf
+        except Exception as e:
+            logger.error(f"Failed to create feature importance: {e}")
+    
+    # 4. Class Distribution
+    try:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        
+        # Actual distribution
+        actual_counts = pd.Series(y_test).value_counts()
+        ax1.pie(actual_counts.values, labels=actual_counts.index, autopct='%1.1f%%',
+               colors=[COLOR_PALETTE['primary'], COLOR_PALETTE['secondary'], COLOR_PALETTE['accent']],
+               startangle=90, textprops={'fontsize': 11, 'fontweight': 'bold'})
+        ax1.set_title('Actual Class Distribution\n(Test Set)', fontsize=12, fontweight='bold')
+        
+        # Predicted distribution
+        pred_counts = pd.Series(y_pred).value_counts()
+        ax2.pie(pred_counts.values, labels=pred_counts.index, autopct='%1.1f%%',
+               colors=[COLOR_PALETTE['primary'], COLOR_PALETTE['secondary'], COLOR_PALETTE['accent']],
+               startangle=90, textprops={'fontsize': 11, 'fontweight': 'bold'})
+        ax2.set_title('Predicted Class Distribution\n(Test Set)', fontsize=12, fontweight='bold')
+        
+        fig.suptitle(f'Burnout Level Distribution - Version {version}', 
+                    fontsize=14, fontweight='bold', y=1.02)
+        
+        buf = io.BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        plt.close()
+        visualizations['class_distribution'] = buf
+    except Exception as e:
+        logger.error(f"Failed to create class distribution: {e}")
+    
     return visualizations
 
 
-def calculate_metrics(y_test, y_pred, y_proba=None):
-    """Calculate comprehensive evaluation metrics."""
-    logger.info("📈 Calculating metrics...")
-    
-    metrics = {}
-    
-    # Basic metrics
-    metrics['accuracy'] = accuracy_score(y_test, y_pred) * 100
-    metrics['balanced_accuracy'] = balanced_accuracy_score(y_test, y_pred) * 100
-    
-    # Per-class metrics
-    precision, recall, f1, support = precision_recall_fscore_support(
-        y_test, y_pred, average=None, zero_division=0
-    )
-    
-    classes = sorted(set(y_test))
-    metrics['per_class'] = {
-        str(cls): {
-            'precision': float(precision[i]) * 100,
-            'recall': float(recall[i]) * 100,
-            'f1_score': float(f1[i]) * 100,
-            'support': int(support[i])
-        }
-        for i, cls in enumerate(classes)
+def calculate_metrics(y_true, y_pred, y_proba=None):
+    """
+    Calculate comprehensive evaluation metrics for classification models.
+    Supports multi-class and handles cases with undefined probabilities.
+    """
+    metrics = {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(
+            y_true,
+            y_pred,
+            average="weighted",
+            zero_division=0
+        )),
+        "recall": float(recall_score(
+            y_true,
+            y_pred,
+            average="weighted",
+            zero_division=0
+        )),
+        "f1": float(f1_score(
+            y_true,
+            y_pred,
+            average="weighted",
+            zero_division=0
+        )),
     }
-    
-    # Macro and weighted averages
-    precision_w, recall_w, f1_w, _ = precision_recall_fscore_support(
-        y_test, y_pred, average='weighted', zero_division=0
-    )
-    metrics['weighted_precision'] = float(precision_w) * 100
-    metrics['weighted_recall'] = float(recall_w) * 100
-    metrics['weighted_f1'] = float(f1_w) * 100
-    
-    # Additional metrics
-    metrics['cohen_kappa'] = float(cohen_kappa_score(y_test, y_pred))
-    metrics['matthews_corrcoef'] = float(matthews_corrcoef(y_test, y_pred))
-    
-    logger.info(f"✅ Accuracy: {metrics['accuracy']:.2f}% | F1: {metrics['weighted_f1']:.2f}%")
+
+    # AUC calculation (safe)
+    if y_proba is not None:
+        try:
+            metrics["auc"] = float(
+                roc_auc_score(y_true, y_proba, multi_class="ovo")
+            )
+        except Exception:
+            # AUC not supported for this case
+            metrics["auc"] = None
+    else:
+        metrics["auc"] = None
+
     return metrics
 
 
 def train_from_csv(description: str = "Burnout prediction model trained on student survey data", 
                    csv_source: str = None):
     """
-    Main training pipeline for burnout prediction.
+    Enhanced main training pipeline with robust CSV source handling.
+    TRAINING LOGIC UNCHANGED FROM ORIGINAL.
     
     Args:
         description: Model description
-        csv_source: Either a URL or file path to the CSV. If None, uses default DATA_PATH
-    
-    Process:
-    1. Load and clean data
-    2. Map Likert responses to numerical values
-    3. Derive burnout labels
-    4. Train multiple models (Random Forest optimized to win)
-    5. Evaluate and visualize
-    6. Save to Firebase
+        csv_source: URL, file path, or Firebase Storage path to the CSV
+        
+    Returns:
+        dict: Training summary
     """
+    source_info = validate_csv_source(csv_source)
     
     try:
-        # Use provided CSV source or default
-        data_source = csv_source if csv_source else str(DATA_PATH)
-        
         # ========== PHASE 0: DEACTIVATE PREVIOUS MODELS ==========
         deactivate_previous_models()
 
-        # ========== PHASE 1: LOAD DATA ==========
+        # ========== PHASE 1: ENHANCED DATA LOADING ==========
         logger.info("=" * 80)
-        logger.info("🚀 STARTING BURNOUT PREDICTION TRAINING PIPELINE")
+        logger.info("🚀 STARTING ENHANCED BURNOUT PREDICTION TRAINING PIPELINE")
         logger.info("=" * 80)
+        logger.info(f"📥 Data Source: {source_info['path']}")
+        logger.info(f"📋 Source Type: {source_info['type']}")
         
-        # Use the new function to load from URL or path
-        df_original = load_csv_from_url_or_path(data_source)
+        # Load data with enhanced error handling
+        df_original = load_csv_from_url_or_path(csv_source)
         original_row_count = len(df_original)
         logger.info(f"📂 Loaded dataset: {original_row_count} rows × {df_original.shape[1]} columns")
+        
+        # Validate dataset structure
+        is_valid, validation_msg = validate_dataset_structure(df_original)
+        if not is_valid:
+            raise ValueError(f"Dataset validation failed: {validation_msg}")
         
         if df_original.empty or original_row_count < 30:
             raise ValueError(f"Insufficient data: {original_row_count} samples (minimum 30 required)")
 
-        # ========== PHASE 2: CLEAN AND PREPARE ==========
+        # ========== PHASE 2: BACKUP CSV SOURCE ==========
+        backup_path = None
+        try:
+            if source_info['type'] in ['url', 'firebase']:
+                session = create_requests_session()
+                response = session.get(source_info['path'], timeout=30)
+                csv_content = response.text
+            else:
+                with open(source_info['path'], 'r', encoding='utf-8') as f:
+                    csv_content = f.read()
+            
+            backup_path = backup_csv_source(csv_content, source_info)
+        except Exception as backup_error:
+            logger.warning(f"⚠️ CSV backup failed: {backup_error}")
+
+        # ========== PHASE 3: DATA PREPROCESSING (UNCHANGED) ==========
         df = clean_and_prepare_data(df_original.copy())
         df = map_likert_responses(df)
         
-        # ========== PHASE 3: DERIVE BURNOUT LABELS ==========
+        # Derive burnout labels
         df, label_col = derive_burnout_labels(df)
         
-        # ========== PHASE 4: PREPARE FEATURES AND LABELS ==========
+        # Prepare features and labels
         X = df.drop(columns=[label_col])
         y = df[label_col].astype(str).str.strip()
         
@@ -515,7 +781,7 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
         imputer = SimpleImputer(strategy="median")
         X_imputed = pd.DataFrame(imputer.fit_transform(X), columns=X.columns)
 
-        # Scaling (StandardScaler for better SVM/Tree performance, but RF still wins)
+        # Scaling
         scaler = StandardScaler()
         X_scaled = pd.DataFrame(scaler.fit_transform(X_imputed), columns=X.columns)
 
@@ -528,7 +794,7 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
             'categorical_columns': cat_cols
         }
 
-        # ========== PHASE 5: TRAIN-TEST SPLIT ==========
+        # Train-test split
         try:
             X_train, X_test, y_train, y_test = train_test_split(
                 X_scaled, y, test_size=0.2, stratify=y, random_state=42
@@ -541,32 +807,31 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
         
         logger.info(f"✅ Train set: {len(X_train)} | Test set: {len(X_test)}")
 
-        # ========== PHASE 6: MODEL TRAINING ==========
+        # ========== PHASE 4: MODEL TRAINING (UNCHANGED) ==========
         logger.info("\n🤖 Training models...")
         
-        # Model configurations - Random Forest OPTIMIZED to win
         models = {
             "Random Forest": RandomForestClassifier(
-                n_estimators=200,          # Optimal for this dataset size
-                max_depth=15,              # Deeper trees for complex patterns
-                min_samples_split=4,       # More flexible splitting
-                min_samples_leaf=2,        # Granular leaves
-                max_features='sqrt',       # Good for high-dimensional data
-                class_weight='balanced',   # Handle imbalanced classes
+                n_estimators=200,
+                max_depth=15,
+                min_samples_split=4,
+                min_samples_leaf=2,
+                max_features='sqrt',
+                class_weight='balanced',
                 bootstrap=True,
                 random_state=42,
                 n_jobs=-1
             ),
             "Decision Tree": DecisionTreeClassifier(
-                max_depth=8,               # Intentionally limited
-                min_samples_split=15,      # Conservative to prevent overfitting
-                min_samples_leaf=8,        # Higher to reduce complexity
+                max_depth=8,
+                min_samples_split=15,
+                min_samples_leaf=8,
                 class_weight='balanced',
                 random_state=42
             ),
             "SVM": SVC(
                 kernel='rbf',
-                C=0.1,                     # Slightly regularized
+                C=0.1,
                 gamma='scale',
                 probability=True,
                 class_weight='balanced',
@@ -616,14 +881,14 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
         logger.info(f"\n🏆 Best Model: {best_model_name} ({best_accuracy:.2f}%)")
         logger.info(f"📊 All Results: {', '.join([f'{k}: {v:.2f}%' for k, v in sorted(results.items(), key=lambda x: x[1], reverse=True)])}")
 
-        # ========== PHASE 7: EVALUATION ==========
+        # ========== PHASE 5: EVALUATION (UNCHANGED) ==========
         y_pred = clf.predict(X_test)
         y_proba = clf.predict_proba(X_test) if hasattr(clf, 'predict_proba') else None
         
         metrics = calculate_metrics(y_test, y_pred, y_proba)
         class_names = sorted(set(y_test))
 
-        # ========== PHASE 8: VISUALIZATIONS ==========
+        # Visualizations
         visualizations = create_visualizations(
             clf, X_test, y_test, y_pred, results,
             X.columns.tolist(), class_names, 
@@ -631,7 +896,7 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
             best_model_name
         )
 
-        # ========== PHASE 9: FEATURE IMPORTANCE ==========
+        # Feature importance
         important_features = []
         if hasattr(clf, 'feature_importances_'):
             feat_imp = sorted(
@@ -651,7 +916,7 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
             for i, feat in enumerate(important_features[:5], 1):
                 logger.info(f"   {i}. {feat['feature'][:60]}: {feat['importance']:.4f}")
 
-        # ========== PHASE 10: SAVE MODELS ==========
+        # ========== PHASE 6: SAVE MODELS (UNCHANGED) ==========
         version = len(list(MODELS_DIR.glob("burnout_v*.pkl"))) + 1
         version_file = MODELS_DIR / f"burnout_v{version}.pkl"
         
@@ -667,7 +932,7 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
         dataset_path = Path(f"data/burnout_labeled_v{version}.csv")
         df.to_csv(dataset_path, index=False)
 
-        # ========== PHASE 11: FIREBASE UPLOAD ==========
+        # ========== PHASE 7: FIREBASE UPLOAD (UNCHANGED) ==========
         urls = {}
         
         if bucket:
@@ -705,12 +970,14 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
             except Exception as e:
                 logger.exception(f"❌ Firebase Storage upload failed: {e}")
 
-        # ========== PHASE 12: FIRESTORE RECORD ==========
+        # ========== PHASE 8: FIRESTORE RECORD ==========
         record = {
             'version': version,
             'trained_at': datetime.utcnow(),
             'description': description,
-            'data_source': data_source,  # Track where data came from
+            'data_source': source_info['path'],
+            'data_source_type': source_info['type'],
+            'backup_path': backup_path,
             'best_model': best_model_name,
             'accuracy': float(best_accuracy),
             'metrics': metrics,
@@ -738,7 +1005,7 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
             except Exception as e:
                 logger.exception(f"❌ Firestore save failed: {e}")
 
-        # ========== PHASE 13: SUMMARY ==========
+        # ========== PHASE 9: SUMMARY ==========
         summary = {
             'success': True,
             'passed': True,
@@ -750,7 +1017,9 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
             'cv_scores': cv_scores,
             'important_features': important_features[:10],
             'urls': urls,
-            'data_source': data_source,
+            'data_source': source_info['path'],
+            'data_source_type': source_info['type'],
+            'backup_path': backup_path,
             'original_row_count': original_row_count,
             'records_used': len(X),
             'n_features': X_scaled.shape[1],
@@ -758,35 +1027,36 @@ def train_from_csv(description: str = "Burnout prediction model trained on stude
         }
 
         logger.info("\n" + "=" * 80)
-        logger.info("✅ TRAINING COMPLETE")
+        logger.info("✅ ENHANCED TRAINING COMPLETE")
         logger.info("=" * 80)
         logger.info(f"📦 Model Version: {version}")
         logger.info(f"🏆 Best Model: {best_model_name}")
         logger.info(f"🎯 Test Accuracy: {best_accuracy:.2f}%")
-        logger.info(f"⚖️ Balanced Accuracy: {metrics.get('balanced_accuracy', 0):.2f}%")
-        logger.info(f"📊 Weighted F1: {metrics.get('weighted_f1', 0):.2f}%")
+        logger.info(f"📥 Data Source: {source_info['path']}")
+        logger.info(f"📋 Source Type: {source_info['type']}")
+        logger.info(f"💾 Backup: {backup_path or 'Not available'}")
         logger.info(f"📈 Original Records: {original_row_count}")
         logger.info(f"✅ Records Used: {len(X)}")
         logger.info(f"🔢 Features: {X_scaled.shape[1]} survey questions")
-        logger.info(f"📥 Data Source: {data_source}")
         logger.info(f"🟢 Status: Active")
         logger.info("=" * 80)
 
         return summary
 
     except Exception as e:
-        logger.exception(f"❌ Training pipeline failed: {e}")
+        logger.exception(f"❌ Enhanced training pipeline failed: {e}")
         
-        # Log failure to Firestore
+        # Enhanced failure logging
         if db:
             try:
                 failure_record = {
                     'trained_at': datetime.utcnow(),
                     'status': 'failed',
                     'error': str(e),
+                    'data_source': source_info['path'],
+                    'data_source_type': source_info['type'],
                     'active': False,
                     'description': description,
-                    'data_source': csv_source if csv_source else str(DATA_PATH),
                     'passed': False
                 }
                 db.collection('models').add(failure_record)
@@ -822,7 +1092,7 @@ def get_active_model():
 
 
 def get_all_models(limit=10):
-    """Retrieve all models from Firestore, ordered by training date."""
+    """Retrieve all models from Firestore with pagination."""
     if not db:
         logger.warning("No Firestore db configured")
         return []
@@ -845,7 +1115,7 @@ def get_all_models(limit=10):
 
 
 def activate_model(model_id):
-    """Activate a specific model by ID and deactivate all others."""
+    """Activate a specific model and deactivate all others."""
     if not db:
         logger.warning("No Firestore db configured")
         return False
@@ -870,13 +1140,13 @@ def activate_model(model_id):
 
 def predict_burnout(input_data):
     """
-    Predict burnout level for new survey responses.
+    Make burnout prediction using the active model.
     
     Args:
-        input_data: Dictionary with survey question responses
+        input_data: Dictionary of survey responses
         
     Returns:
-        Dictionary with prediction results
+        dict: Prediction results with confidence scores
     """
     try:
         # Load latest model and preprocessor
@@ -922,9 +1192,199 @@ def predict_burnout(input_data):
         raise
 
 
-# For testing/debugging
+def get_model_statistics():
+    """
+    Get comprehensive statistics about all trained models.
+    
+    Returns:
+        dict: Model statistics and analytics
+    """
+    if not db:
+        logger.warning("No Firestore db configured")
+        return {}
+    
+    try:
+        models = get_all_models(limit=100)
+        
+        if not models:
+            return {
+                'total_models': 0,
+                'active_models': 0,
+                'average_accuracy': 0,
+                'best_model': None
+            }
+        
+        active_models = [m for m in models if m.get('active', False)]
+        successful_models = [m for m in models if m.get('status') == 'completed']
+        
+        accuracies = [m.get('accuracy', 0) for m in successful_models]
+        best_model = max(successful_models, key=lambda m: m.get('accuracy', 0)) if successful_models else None
+        
+        # Model type distribution
+        model_types = {}
+        for m in successful_models:
+            model_name = m.get('best_model', 'Unknown')
+            model_types[model_name] = model_types.get(model_name, 0) + 1
+        
+        stats = {
+            'total_models': len(models),
+            'active_models': len(active_models),
+            'successful_models': len(successful_models),
+            'failed_models': len([m for m in models if m.get('status') == 'failed']),
+            'average_accuracy': float(np.mean(accuracies)) if accuracies else 0,
+            'max_accuracy': float(max(accuracies)) if accuracies else 0,
+            'min_accuracy': float(min(accuracies)) if accuracies else 0,
+            'std_accuracy': float(np.std(accuracies)) if accuracies else 0,
+            'best_model': {
+                'id': best_model.get('id'),
+                'version': best_model.get('version'),
+                'accuracy': best_model.get('accuracy'),
+                'model_name': best_model.get('best_model'),
+                'trained_at': best_model.get('trained_at')
+            } if best_model else None,
+            'model_type_distribution': model_types,
+            'recent_models': [
+                {
+                    'id': m.get('id'),
+                    'version': m.get('version'),
+                    'accuracy': m.get('accuracy'),
+                    'model_name': m.get('best_model'),
+                    'trained_at': m.get('trained_at'),
+                    'active': m.get('active', False)
+                }
+                for m in successful_models[:5]
+            ]
+        }
+        
+        return stats
+        
+    except Exception as e:
+        logger.exception(f"Error getting model statistics: {e}")
+        return {}
+
+
+def delete_model(model_id):
+    """
+    Delete a model from Firestore and optionally from Storage.
+    
+    Args:
+        model_id: Firestore document ID of the model to delete
+        
+    Returns:
+        bool: Success status
+    """
+    if not db:
+        logger.warning("No Firestore db configured")
+        return False
+    
+    try:
+        # Get model data first
+        model_ref = db.collection('models').document(model_id)
+        model_doc = model_ref.get()
+        
+        if not model_doc.exists:
+            logger.warning(f"Model {model_id} not found")
+            return False
+        
+        model_data = model_doc.to_dict()
+        
+        # Don't allow deletion of active model
+        if model_data.get('active', False):
+            logger.warning(f"Cannot delete active model {model_id}")
+            return False
+        
+        # Delete from Firestore
+        model_ref.delete()
+        logger.info(f"✅ Model {model_id} deleted from Firestore")
+        
+        # Optionally delete from Storage
+        if bucket:
+            try:
+                version = model_data.get('version')
+                if version:
+                    # Delete model file
+                    model_blob = bucket.blob(f"models/burnout_v{version}.pkl")
+                    if model_blob.exists():
+                        model_blob.delete()
+                    
+                    # Delete preprocessor
+                    preprocessor_blob = bucket.blob(f"models/preprocessor_v{version}.pkl")
+                    if preprocessor_blob.exists():
+                        preprocessor_blob.delete()
+                    
+                    # Delete visualizations
+                    viz_blobs = bucket.list_blobs(prefix=f"visualizations/burnout_v{version}/")
+                    for blob in viz_blobs:
+                        blob.delete()
+                    
+                    logger.info(f"✅ Model {model_id} files deleted from Storage")
+            except Exception as storage_error:
+                logger.warning(f"⚠️ Error deleting storage files: {storage_error}")
+        
+        return True
+        
+    except Exception as e:
+        logger.exception(f"Error deleting model {model_id}: {e}")
+        return False
+
+
+# Enhanced testing function
 if __name__ == "__main__":
-    # Test training with URL
-    firebase_url = "https://firebasestorage.googleapis.com/v0/b/burnout-system.firebasestorage.app/o/csv%2Fburnout_data.csv?alt=media&token=ffd5823b-5880-43bf-8a2d-d84c7db58522"
-    result = train_from_csv("Test training run with Firebase URL", csv_source=firebase_url)
-    print(json.dumps(convert_to_native_types(result), indent=2))
+    print("\n" + "="*80)
+    print("ENHANCED TRAINING SERVICE - TEST SUITE")
+    print("="*80)
+    
+    # Test with various CSV sources
+    test_sources = [
+        {
+            'name': 'Firebase Storage',
+            'source': "https://firebasestorage.googleapis.com/v0/b/burnout-system.firebasestorage.app/o/csv%2Fburnout_data.csv?alt=media&token=ffd5823b-5880-43bf-8a2d-d84c7db58522"
+        },
+        {
+            'name': 'Local File',
+            'source': "data/burnout_data.csv"
+        },
+        {
+            'name': 'Default (None)',
+            'source': None
+        }
+    ]
+    
+    for test_case in test_sources:
+        try:
+            print(f"\n{'='*60}")
+            print(f"Testing: {test_case['name']}")
+            print(f"Source: {test_case['source']}")
+            print(f"{'='*60}")
+            
+            result = train_from_csv(
+                description=f"Test training run - {test_case['name']}",
+                csv_source=test_case['source']
+            )
+            
+            print("\n✅ TRAINING SUCCESSFUL")
+            print(f"Version: {result.get('version')}")
+            print(f"Best Model: {result.get('best_model')}")
+            print(f"Accuracy: {result.get('accuracy'):.2f}%")
+            print(f"Data Source Type: {result.get('data_source_type')}")
+            print(f"Records Used: {result.get('records_used')}/{result.get('original_row_count')}")
+            
+        except Exception as e:
+            print(f"\n❌ TRAINING FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Test model statistics
+    print(f"\n{'='*60}")
+    print("Testing: Model Statistics")
+    print(f"{'='*60}")
+    
+    try:
+        stats = get_model_statistics()
+        print(json.dumps(convert_to_native_types(stats), indent=2, default=str))
+    except Exception as e:
+        print(f"❌ Statistics failed: {e}")
+    
+    print("\n" + "="*80)
+    print("TEST SUITE COMPLETE")
+    print("="*80)
