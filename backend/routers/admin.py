@@ -2,6 +2,7 @@
 from fastapi import APIRouter, HTTPException, Query, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from typing import Optional
 from datetime import datetime
 import pandas as pd
 import os
@@ -40,16 +41,89 @@ def _require_admin(x_admin_secret: str = Header(None)):
 
 
 # ===============================
-# 🧠 Train Endpoint (one-shot)
+# 📝 Pydantic Models for Request Bodies
+# ===============================
+class TrainRequest(BaseModel):
+    description: Optional[str] = "Initial train via admin panel"
+    csv_source: Optional[str] = None  # Can be URL or file path
+
+
+# ===============================
+# 🧠 Train Endpoint (one-shot) - UPDATED
 # ===============================
 @router.post("/admin/train")
 def train_model(
-    description: str = Query("Initial train via admin panel", description="Description for model metadata"),
+    payload: TrainRequest,
     x_admin_secret: str = Header(None),
 ):
+    """
+    Train a new model from CSV data.
+    
+    Args:
+        payload.description: Description for model metadata
+        payload.csv_source: Optional URL or file path to CSV. If None, uses default data path.
+    """
     _require_admin(x_admin_secret)
+    
     try:
-        result = train_from_csv(description=description)
+        logger.info(f"🚀 Training request received - Description: {payload.description}")
+        if payload.csv_source:
+            logger.info(f"📥 CSV Source: {payload.csv_source}")
+        
+        result = train_from_csv(
+            description=payload.description,
+            csv_source=payload.csv_source
+        )
+        
+        return {
+            "message": "Model trained successfully",
+            "version": result["version"],
+            "records_used": result["records_used"],
+            "accuracy": result["accuracy"],
+            "passed": result["passed"],
+            "trained_at": datetime.utcnow().isoformat(),
+            "description": payload.description,
+            "csv_source": payload.csv_source or "default",
+            "best_model": result.get("best_model"),
+            "metrics": result.get("metrics"),
+            "urls": result.get("urls", {}),
+        }
+    except RuntimeError as e:
+        logger.error(f"❌ Runtime error during training: {e}")
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        logger.error(f"❌ Validation error during training: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("❌ Unexpected error in /admin/train")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+# ===============================
+# 🧠 Alternative: Query Parameter Version (Optional)
+# ===============================
+@router.post("/admin/train-simple")
+def train_model_simple(
+    description: str = Query("Initial train via admin panel", description="Description for model metadata"),
+    csv_source: Optional[str] = Query(None, description="URL or file path to CSV"),
+    x_admin_secret: str = Header(None),
+):
+    """
+    Simpler version using query parameters instead of request body.
+    Use this if your frontend prefers sending data as query params.
+    """
+    _require_admin(x_admin_secret)
+    
+    try:
+        logger.info(f"🚀 Training request received - Description: {description}")
+        if csv_source:
+            logger.info(f"📥 CSV Source: {csv_source}")
+        
+        result = train_from_csv(
+            description=description,
+            csv_source=csv_source
+        )
+        
         return {
             "message": "Model trained successfully",
             "version": result["version"],
@@ -58,13 +132,14 @@ def train_model(
             "passed": result["passed"],
             "trained_at": datetime.utcnow().isoformat(),
             "description": description,
+            "csv_source": csv_source or "default",
         }
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logging.exception("Unexpected error in /admin/train")
+        logging.exception("Unexpected error in /admin/train-simple")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
